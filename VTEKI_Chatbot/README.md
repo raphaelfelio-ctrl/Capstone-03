@@ -1,0 +1,176 @@
+# V-TEKI Workspace — Chatbot Layanan Pelanggan (Gemini + LangGraph)
+
+Prototipe customer service AI. Stack: **FastAPI + SQLite + Gemini API + LangGraph**. Knowledge base saat ini memakai dokumen `knowledge/BCA_Knowledge_Base_Customer_Service.md`.
+
+> **Penting:** ini prototipe independen, **bukan kanal resmi BCA**, dan tidak terhubung ke sistem bank. Persetujuan admin hanya mengubah status demo; tidak ada kartu yang diblokir atau uang yang dipindahkan.
+
+## Yang baru di versi 2
+
+| Fitur | Ringkasnya |
+|---|---|
+| **Knowledge dari file** | Unggah `.md`, `.txt`, `.pdf`, `.docx` (bisa banyak sekaligus, drag & drop). Dokumen dipecah otomatis per judul `##`/`###` menjadi bagian kecil lengkap dengan kategori, kata kunci, URL sumber, dan validitas. |
+| **Versi dokumen** | Unggah file dengan nama sama = versi baru (bagian lama diganti). File identik dilewati. Ada pratinjau, unduh, indeks ulang, aktif/nonaktif per dokumen atau per bagian. |
+| **Folder `knowledge/`** | File di folder ini otomatis diimpor saat backend start (bila baru/berubah). |
+| **Jawaban tidak sembarangan** | Pencarian BM25 + stemmer bahasa Indonesia + ambang skor. Gemini wajib mengembalikan `grounded` + `source_ids`; jika tidak ada sumber → AI bilang belum tahu dan tiket diteruskan ke agen. Sumber jawaban tampil di chat. |
+| **Guardrail anti-manipulasi** | Deteksi prompt injection, jailbreak, roleplay, klaim admin, tag sistem palsu, teks tersamar (spasi/leetspeak/zero-width) + klasifikasi Gemini. Jika terdeteksi: AI berhenti, customer diberi **peringatan**, percakapan **langsung dialihkan ke admin** & dikunci, admin dinotifikasi. Setelah 3 peringatan, AI dinonaktifkan untuk customer tsb. |
+| **Output guard** | Jawaban AI diblok bila menyebut nomor/URL yang tidak ada di knowledge, meminta OTP/PIN, mengaku sudah memblokir/refund, atau membocorkan instruksi. |
+| **Masking data rahasia** | OTP, PIN, password, CVV, dan nomor kartu (cek Luhn) disamarkan sebelum disimpan atau dikirim ke Gemini. |
+| **Routing LangGraph** | Lihat diagram di bawah. Rute tiap pesan terlihat oleh admin di halaman Kasus. |
+
+## 1. Instalasi (Windows)
+
+Paling mudah: klik dua kali **`setup.bat`**, isi `GEMINI_API_KEY` di `backend\.env`, lalu klik **`start_all.bat`**.
+
+Manual:
+
+```powershell
+cd backend
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env     # lewati jika .env sudah ada
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+Terminal kedua: `cd frontend` lalu `py -m http.server 5500`, buka http://127.0.0.1:5500.
+
+> **Upgrade dari versi lama:** cukup jalankan ulang `pip install -r requirements.txt` (ada paket baru: `langgraph`, `python-multipart`, `pypdf`, `python-docx`, `PySastrawi`). Database lama dimigrasi otomatis: kasus, pesan, dan audit tetap utuh; artikel lama (demo Bank Nusantara dan impor teks satu-blok) dijadikan **Draf** dengan kategori "Arsip lama" — tidak dihapus.
+
+## 2. Akun demo
+
+| Peran | Email | Kata sandi |
+|---|---|---|
+| Admin | `admin@vteki.id` | `admin123` |
+| Customer | `customer@vteki.id` | `cust1234` |
+
+## 3. Mengelola knowledge
+
+1. Login Admin → **Basis Pengetahuan**.
+2. Seret file ke kotak unggah (atau klik *Pilih file*). Klik **Pratinjau pemecahan** untuk melihat hasil pecahannya sebelum disimpan, lalu **Unggah**.
+3. Klik dokumen untuk melihat bagian-bagiannya; tiap bagian bisa diedit (judul, kategori, jenis, status, validitas, URL sumber, kata kunci, isi).
+4. Gunakan **Uji pencarian** untuk memastikan pertanyaan customer menemukan bagian yang benar sebelum dipakai.
+
+**Agar dokumen baru terbaca baik**, ikuti pola file BCA:
+
+```markdown
+# Judul dokumen
+**Tanggal penyusunan:** 28 Oktober 2026        ← dibaca sebagai tanggal pemeriksaan
+**Sumber utama:** https://...                   ← URL sumber default
+
+## 0. Instruksi untuk AI Agent                  ← otomatis jenis "instruksi" (panduan perilaku AI)
+## 2. Kanal bantuan resmi
+### Halo BCA                                    ← tiap ### jadi satu bagian
+## 7. FAQ
+### Q1. Bagaimana cara menghubungi Halo BCA?    ← satu pertanyaan = satu bagian
+## 9. Metadata yang disarankan untuk database   ← otomatis jenis "metadata" (tidak dipakai)
+```
+
+Jenis bagian:
+- **fakta** — dicari & dipakai untuk menjawab.
+- **instruksi** — judul seperti "Instruksi untuk AI", "Jika jawaban tidak ditemukan"; ditambahkan ke prompt sebagai panduan (tidak bisa mengalahkan aturan inti).
+- **metadata** — disimpan, tidak pernah dipakai.
+
+Bagian bertanda *dinamis* (biaya, limit, nomor, ketentuan) membuat AI mengingatkan customer untuk memverifikasi di sumber resmi.
+
+## 4. Routing LangGraph
+
+```mermaid
+flowchart TD
+    S([Pesan customer]) --> G{gate}
+    G -- AI dikunci / customer disuspend --> H[human_only: teruskan ke admin]
+    G --> IG[input_guard: masking + pola manipulasi]
+    IG -- manipulasi --> E[escalate: peringatan + alihkan ke admin]
+    IG --> C[classify: Gemini / aturan]
+    C -- manipulasi halus --> E
+    C -- sapaan / di luar topik --> T[respond_template]
+    C --> R[retrieve: BM25 knowledge]
+    R -- tidak ada knowledge --> N[no_answer: tidak menebak]
+    R --> GEN[generate: Gemini JSON grounded]
+    GEN -- manipulasi --> E
+    GEN --> OG[output_guard: cek nomor/URL/klaim]
+    T --> F[finalize: status tiket]
+    N --> F
+    OG --> F
+```
+
+| Intent | Status tiket |
+|---|---|
+| Inquiry terjawab dengan sumber | Selesai otomatis |
+| Inquiry tanpa knowledge / jawaban diblok | Menunggu agen |
+| Komplain | Menunggu agen (prioritas tinggi) |
+| Laporan penipuan / kartu hilang | Menunggu agen (prioritas tinggi, risiko) |
+| Permintaan tindakan (blokir, refund, ubah data) | Menunggu persetujuan |
+| Upaya manipulasi AI | **Dialihkan ke admin** (AI dikunci di kasus itu) |
+
+Status "menunggu" tidak turun kembali ke "Selesai otomatis" hanya karena customer bertanya hal lain.
+
+## 5. Guardrail — alur untuk admin
+
+- Menu **Guardrail** menampilkan semua kejadian (pola manipulasi, deteksi AI, jawaban AI yang diblok, data rahasia yang disamarkan) dan daftar customer yang punya peringatan.
+- **Konfirmasi** = deteksi benar. **Salah deteksi** = peringatan customer dikurangi dan AI di kasus itu aktif lagi.
+- **Pulihkan akses AI & reset peringatan** untuk customer yang telah mencapai batas.
+- Di **Kasus & Percakapan**, tombol **Aktifkan AI kembali** membuka kunci AI untuk satu kasus.
+
+## 6. Konfigurasi (`backend/.env`)
+
+| Variabel | Default | Fungsi |
+|---|---|---|
+| `ORG_NAME` | `BCA` | Nama organisasi di sapaan & prompt. Ganti bila knowledge untuk bank lain. |
+| `LLM_CLASSIFIER` | `true` | Klasifikasi + deteksi manipulasi dengan Gemini (1 panggilan tambahan/pesan). `false` = hemat kuota, aturan pola saja. |
+| `KB_MIN_SCORE` | `3.0` | Ambang relevansi. Naikkan jika AI memakai bagian yang kurang cocok; turunkan jika terlalu sering "belum tahu". |
+| `KB_TOP_K` | `4` | Jumlah bagian maksimum yang dikirim ke Gemini. |
+| `GUARDRAIL_MAX_STRIKES` | `3` | Batas peringatan sebelum AI dinonaktifkan untuk customer. |
+| `KNOWLEDGE_AUTO_SYNC` | `true` | Impor otomatis isi folder `knowledge/` saat start. |
+| `MAX_UPLOAD_MB` | `5` | Batas ukuran file unggahan. |
+
+## 7. Pengujian
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m tests.smoke_test
+```
+
+30 uji end-to-end (upload & versi, pencarian, routing, guardrail, masking, pemulihan admin) dengan Gemini **tiruan** — tidak memakai kuota dan tidak menyentuh `vteki.db`.
+
+## 8. Struktur program
+
+```text
+VTEKI_Chatbot/
+├── knowledge/                      # file knowledge (otomatis diimpor saat start)
+├── frontend/index.html             # UI customer & admin
+└── backend/
+    ├── requirements.txt
+    ├── .env.example
+    ├── tests/smoke_test.py         # uji end-to-end (LLM ditiru)
+    └── app/
+        ├── main.py                 # REST API & penyimpanan hasil
+        ├── agent.py                # graph LangGraph + prompt
+        ├── knowledge.py            # parser file, chunking, BM25
+        ├── guardrails.py           # deteksi manipulasi, masking, output guard
+        ├── llm.py                  # pembungkus Gemini (JSON + model cadangan)
+        ├── db.py                   # skema SQLite + migrasi
+        ├── security.py             # hash password, sesi, role, audit
+        └── config.py
+```
+
+## 9. Endpoint baru
+
+| Endpoint | Fungsi |
+|---|---|
+| `POST /api/knowledge/upload` | Unggah satu/banyak file (multipart: `files`, `status`, `mode`, `category`) |
+| `POST /api/knowledge/preview` | Pratinjau pemecahan file tanpa menyimpan |
+| `GET /api/knowledge/documents` · `GET/PATCH/DELETE /api/knowledge/documents/{id}` | Kelola dokumen |
+| `GET /api/knowledge/documents/{id}/download` · `POST …/reindex` | Unduh teks asli · pecah ulang |
+| `POST /api/knowledge/search-test` | Uji bagian mana yang dipakai untuk sebuah pertanyaan |
+| `GET /api/admin/guardrail` · `POST /api/admin/guardrail/{id}/review` | Kejadian guardrail & tinjauan |
+| `POST /api/admin/users/{id}/restore-ai` · `POST /api/admin/cases/{id}/unlock-ai` | Pulihkan akses AI |
+| `GET /api/admin/graph` | Diagram LangGraph (Mermaid) |
+
+Endpoint lama tetap tersedia. Dokumentasi interaktif: http://127.0.0.1:8000/docs
+
+## 10. Batasan
+
+- Guardrail berlapis menekan risiko manipulasi, tetapi tidak ada guardrail yang 100% kebal; admin tetap perlu meninjau kejadian.
+- Pencarian memakai BM25 (kata), belum embedding/vektor. Untuk ribuan dokumen, pertimbangkan Gemini Embeddings + vector store.
+- Pada free tier Gemini, data input dapat dipakai Google untuk peningkatan produk — jangan masukkan data nasabah asli.
+- Sebelum produksi: HTTPS, rate limiting, ganti akun demo, secret manager, dan kebijakan retensi data.
