@@ -116,6 +116,8 @@ def init_db():
         _add_column(c, 'knowledge', 'validity', "TEXT DEFAULT 'umum'")       # umum | dinamis
         _add_column(c, 'knowledge', 'checked_at', "TEXT DEFAULT ''")
         _add_column(c, 'knowledge', 'position', 'INTEGER NOT NULL DEFAULT 0')
+        _add_column(c, 'knowledge', 'rev', 'INTEGER NOT NULL DEFAULT 1')            # naik tiap kali bagian diedit
+        _add_column(c, 'knowledge_documents', 'org_name', "TEXT DEFAULT ''")      # organisasi pemilik knowledge
         c.execute('CREATE INDEX IF NOT EXISTS idx_knowledge_doc ON knowledge(document_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_messages_case ON messages(case_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_guard_case ON guardrail_events(case_id)')

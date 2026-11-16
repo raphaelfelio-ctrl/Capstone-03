@@ -10,7 +10,7 @@ Prototipe customer service AI. Stack: **FastAPI + SQLite + Gemini API + LangGrap
 |---|---|
 | **Knowledge dari file** | Unggah `.md`, `.txt`, `.pdf`, `.docx` (bisa banyak sekaligus, drag & drop). Dokumen dipecah otomatis per judul `##`/`###` menjadi bagian kecil lengkap dengan kategori, kata kunci, URL sumber, dan validitas. |
 | **Versi dokumen** | Unggah file dengan nama sama = versi baru (bagian lama diganti). File identik dilewati. Ada pratinjau, unduh, indeks ulang, aktif/nonaktif per dokumen atau per bagian. |
-| **Folder `knowledge/`** | File di folder ini otomatis diimpor saat backend start (bila baru/berubah). |
+| **Folder `knowledge/`** | File di folder ini otomatis diimpor saat backend start (bila baru/berubah). File yang dihapus dari folder → dokumennya otomatis **Nonaktif** (tidak dihapus); dikembalikan → aktif lagi. |
 | **Jawaban tidak sembarangan** | Pencarian BM25 + stemmer bahasa Indonesia + ambang skor. Gemini wajib mengembalikan `grounded` + `source_ids`; jika tidak ada sumber → AI bilang belum tahu dan tiket diteruskan ke agen. Sumber jawaban tampil di chat. |
 | **Guardrail anti-manipulasi** | Deteksi prompt injection, jailbreak, roleplay, klaim admin, tag sistem palsu, teks tersamar (spasi/leetspeak/zero-width) + klasifikasi Gemini. Jika terdeteksi: AI berhenti, customer diberi **peringatan**, percakapan **langsung dialihkan ke admin** & dikunci, admin dinotifikasi. Setelah 3 peringatan, AI dinonaktifkan untuk customer tsb. |
 | **Output guard** | Jawaban AI diblok bila menyebut nomor/URL yang tidak ada di knowledge, meminta OTP/PIN, mengaku sudah memblokir/refund, atau membocorkan instruksi. |
@@ -54,6 +54,7 @@ Terminal kedua: `cd frontend` lalu `py -m http.server 5500`, buka http://127.0.0
 
 ```markdown
 # Judul dokumen
+**Organisasi:** Bank BCA                        ← nama organisasi di sapaan & prompt AI (opsional; bila tidak ada ditebak dari judul "... Bank X", bisa diubah lewat tombol Organisasi)
 **Tanggal penyusunan:** 28 Oktober 2026        ← dibaca sebagai tanggal pemeriksaan
 **Sumber utama:** https://...                   ← URL sumber default
 
@@ -115,9 +116,10 @@ Status "menunggu" tidak turun kembali ke "Selesai otomatis" hanya karena custome
 
 | Variabel | Default | Fungsi |
 |---|---|---|
-| `ORG_NAME` | `BCA` | Nama organisasi di sapaan & prompt. Ganti bila knowledge untuk bank lain. |
+| `ORG_NAME` | `BCA` | Nama organisasi **cadangan**. Nama utama diambil otomatis dari dokumen knowledge yang aktif (lihat bagian 3), jadi ikut berganti saat knowledge diganti. |
 | `LLM_CLASSIFIER` | `true` | Klasifikasi + deteksi manipulasi dengan Gemini (1 panggilan tambahan/pesan). `false` = hemat kuota, aturan pola saja. |
 | `KB_MIN_SCORE` | `3.0` | Ambang relevansi. Naikkan jika AI memakai bagian yang kurang cocok; turunkan jika terlalu sering "belum tahu". |
+| `KB_SCORE_REF_DOCS` | `20` | `KB_MIN_SCORE` berlaku penuh bila bagian aktif ≥ angka ini; untuk knowledge lebih kecil ambang diturunkan proporsional agar dokumen kecil tetap bisa menjawab. |
 | `KB_TOP_K` | `4` | Jumlah bagian maksimum yang dikirim ke Gemini. |
 | `GUARDRAIL_MAX_STRIKES` | `3` | Batas peringatan sebelum AI dinonaktifkan untuk customer. |
 | `KNOWLEDGE_AUTO_SYNC` | `true` | Impor otomatis isi folder `knowledge/` saat start. |
@@ -131,6 +133,17 @@ cd backend
 ```
 
 30 uji end-to-end (upload & versi, pencarian, routing, guardrail, masking, pemulihan admin) dengan Gemini **tiruan** — tidak memakai kuota dan tidak menyentuh `vteki.db`.
+
+Uji pergantian knowledge (40 uji: ganti dokumen, versi baru, edit bagian, riwayat percakapan, nama organisasi, folder `knowledge/`):
+
+```powershell
+.\.venv\Scripts\python.exe -m tests.knowledge_switch_test
+```
+
+### Mengganti knowledge dengan aman
+1. Unggah dokumen baru, lalu **nonaktifkan** dokumen lama (dua dokumen aktif = jawaban bisa bercampur).
+2. Nama organisasi di sapaan/prompt otomatis mengikuti dokumen aktif.
+3. Jawaban AI lama yang sumbernya dinonaktifkan/diedit otomatis dikeluarkan dari riwayat yang dikirim ke Gemini.
 
 ## 8. Struktur program
 

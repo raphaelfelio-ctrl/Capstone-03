@@ -25,7 +25,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
-from .config import CHUNK_MAX_CHARS, KB_MIN_SCORE, KB_RELATIVE_CUTOFF, KB_TOP_K
+from .config import CHUNK_MAX_CHARS, KB_MIN_SCORE, KB_RELATIVE_CUTOFF, KB_SCORE_REF_DOCS, KB_TOP_K, ORG_NAME
 from .db import connect
 
 log = logging.getLogger("vteki.knowledge")
@@ -284,6 +284,20 @@ def _parse_checked_at(text: str) -> str:
     return m.group(0) if m else ""
 
 
+ORG_LINE_RE = re.compile(r"^\W*(organisasi|nama organisasi|organization|perusahaan|bank)\W*:\W*(.+?)\W*$", re.I | re.M)
+ORG_TITLE_RE = re.compile(r"\b(Bank\s+(?!Indonesia\b)[A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,2})")
+
+
+def guess_org(title: str, preamble: str = "") -> str:
+    """Nama organisasi pemilik knowledge: baris "**Organisasi:** X" di awal dokumen,
+    atau tebakan dari judul ("Knowledge Base ... — Bank BCA" -> "Bank BCA")."""
+    m = ORG_LINE_RE.search(re.sub(r"[*_`]", "", preamble or ""))
+    if m:
+        return m.group(2).strip()[:120]
+    m = ORG_TITLE_RE.search(re.sub(r"[*_`]", "", title or ""))
+    return m.group(1).strip()[:120] if m else ""
+
+
 def _split_long(body: str, limit: int) -> list[str]:
     if len(body) <= limit:
         return [body]
@@ -336,6 +350,7 @@ def chunk_document(text: str, default_title: str = "Dokumen") -> dict:
     urls = URL_RE.findall(preamble)
     doc_source = urls[0].rstrip(".,;") if urls else ""
     checked_at = _parse_checked_at(text)
+    org_name = guess_org(doc_title, preamble)
 
     # Dokumen tanpa judul sama sekali (txt/pdf polos) -> potong per ukuran.
     has_headings = any(s["h2"] or s["h3"] for s in sections)
@@ -370,7 +385,7 @@ def chunk_document(text: str, default_title: str = "Dokumen") -> dict:
                 "checked_at": checked_at,
                 "status": "Draf" if kind == "metadata" else "Aktif",
             })
-    return {"title": doc_title[:200], "source_url": doc_source, "checked_at": checked_at, "chunks": chunks}
+    return {"title": doc_title[:200], "source_url": doc_source, "checked_at": checked_at, "org_name": org_name, "chunks": chunks}
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +412,7 @@ def ingest_document(*, filename: str, data: bytes | None = None, text: str | Non
     if not parsed["chunks"]:
         raise KnowledgeFileError("Tidak ada bagian yang dapat diambil dari dokumen.")
     doc_title = (title or parsed["title"])[:200]
+    org_name = parsed["org_name"] or guess_org(doc_title)
     # Status dokumen: Aktif | Nonaktif. ("Draf" saat upload = dokumen disimpan tapi belum dipakai AI.)
     status = "Nonaktif" if status in ("Draf", "Nonaktif") else "Aktif"
 
@@ -416,15 +432,16 @@ def ingest_document(*, filename: str, data: bytes | None = None, text: str | Non
             c.execute("DELETE FROM knowledge WHERE document_id=?", (doc_id,))
             c.execute("""UPDATE knowledge_documents SET title=?, filename=?, file_type=?, sha256=?, version=?,
                          chunk_count=?, source_url=?, checked_at=?, raw_text=?, uploaded_by=?, status=?,
+                         org_name=CASE WHEN ?<>'' THEN ? ELSE org_name END,
                          updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                       (doc_title, filename, ftype, digest, version, len(parsed["chunks"]), parsed["source_url"],
-                       parsed["checked_at"], text, uploaded_by, status, doc_id))
+                       parsed["checked_at"], text, uploaded_by, status, org_name, org_name, doc_id))
             action = "replaced"
         else:
             cur = c.execute("""INSERT INTO knowledge_documents(title,filename,file_type,sha256,version,status,
-                               chunk_count,source_url,checked_at,raw_text,uploaded_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                               chunk_count,source_url,checked_at,raw_text,uploaded_by,org_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (doc_title, filename, ftype, digest, 1, status, len(parsed["chunks"]), parsed["source_url"],
-                             parsed["checked_at"], text, uploaded_by))
+                             parsed["checked_at"], text, uploaded_by, org_name))
             doc_id, version, action = cur.lastrowid, 1, "created"
         for pos, ch in enumerate(parsed["chunks"]):
             c.execute("""INSERT INTO knowledge(title,category,keywords,body,status,document_id,section,kind,
@@ -450,40 +467,82 @@ def mark_deleted(filename: str) -> None:
         c.execute("INSERT INTO app_meta(key,value) VALUES(?,'1') ON CONFLICT(key) DO UPDATE SET value='1'", (_tombstone_key(filename),))
 
 
-def active_fact_ids(ids, since: str = "") -> set:
-    """Subset id bagian yang SAAT INI masih aktif dipakai AI (belum dihapus/dinonaktifkan).
-    Bila `since` diisi, bagian yang diedit setelah waktu itu dianggap berubah (tidak lagi valid)."""
-    ids = [int(i) for i in ids if str(i).lstrip("-").isdigit()]
+def sources_still_valid(sources: list, since: str = "") -> bool:
+    """True bila SEMUA bagian sumber sebuah jawaban lama masih aktif dan isinya belum berubah.
+
+    Tiap bagian punya nomor revisi (`rev`) yang naik setiap kali diedit; jawaban menyimpan
+    revisi saat dibuat. Jawaban lama (sebelum ada revisi) memakai perbandingan waktu `since`."""
+    ids = [int(s_["id"]) for s_ in sources if str(s_.get("id", "")).lstrip("-").isdigit()]
     if not ids:
-        return set()
+        return True
     with connect() as c:
-        rows = c.execute(f"""SELECT k.id FROM knowledge k LEFT JOIN knowledge_documents d ON d.id=k.document_id
+        rows = c.execute(f"""SELECT k.id, k.rev, k.updated_at FROM knowledge k LEFT JOIN knowledge_documents d ON d.id=k.document_id
                              WHERE k.id IN ({','.join('?' * len(ids))}) AND k.status='Aktif' AND k.kind='fakta'
-                             AND (d.id IS NULL OR d.status='Aktif')
-                             AND (?='' OR k.updated_at<=?)""", [*ids, since, since]).fetchall()
-    return {r["id"] for r in rows}
+                             AND (d.id IS NULL OR d.status='Aktif')""", ids).fetchall()
+    current = {r["id"]: r for r in rows}
+    for s_ in sources:
+        r = current.get(int(s_.get("id", -1))) if str(s_.get("id", "")).lstrip("-").isdigit() else None
+        if r is None:
+            return False
+        if s_.get("rev") is not None:
+            if int(s_["rev"]) != int(r["rev"] or 1):
+                return False
+        elif since and (r["updated_at"] or "") > since:
+            return False
+    return True
+
+
+def _missing_key(filename: str) -> str:
+    return "kb_sync_missing:" + filename
 
 
 def sync_knowledge_dir(folder: Path) -> list[dict]:
-    """Impor otomatis file di folder knowledge/ (baru atau berubah) saat startup."""
+    """Sinkron folder knowledge/ saat startup.
+
+    - File baru/berubah diimpor (versi baru bila nama sama).
+    - Dokumen hasil sinkron yang filenya sudah TIDAK ADA di folder dinonaktifkan (tidak dihapus),
+      sehingga AI berhenti memakainya. Bila file itu dikembalikan, dokumen diaktifkan lagi.
+    - Dokumen yang diganti/dihapus lewat menu admin tidak disentuh.
+    """
     results = []
     if not folder.exists():
         return results
+    tag = f"sync:{folder.name}/"
+    present = set()
     for path in sorted(folder.iterdir()):
         if not path.is_file() or path.suffix.lower() not in ALLOWED_EXT or path.name.startswith(("~", ".")):
             continue
+        present.add(path.name)
         with connect() as c:
             deleted = c.execute("SELECT 1 FROM app_meta WHERE key=?", (_tombstone_key(path.name),)).fetchone()
-            current = c.execute("SELECT uploaded_by FROM knowledge_documents WHERE filename=? ORDER BY id DESC LIMIT 1", (path.name,)).fetchone()
+            current = c.execute("SELECT id,uploaded_by FROM knowledge_documents WHERE filename=? ORDER BY id DESC LIMIT 1", (path.name,)).fetchone()
         if deleted or (current and not (current["uploaded_by"] or "").startswith("sync:")):
             # Sudah dihapus admin, atau versinya sudah diganti lewat menu -> jangan ditimpa/dihidupkan lagi.
             results.append({"filename": path.name, "action": "skipped"})
             continue
         try:
-            results.append(ingest_document(filename=path.name, data=path.read_bytes(), mode="auto", uploaded_by="sync:knowledge/"))
+            r = ingest_document(filename=path.name, data=path.read_bytes(), mode="auto", uploaded_by=tag)
         except Exception as exc:
             log.warning("Gagal impor %s: %s", path.name, exc)
             results.append({"filename": path.name, "action": "error", "error": str(exc)})
+            continue
+        with connect() as c:
+            if c.execute("SELECT 1 FROM app_meta WHERE key=?", (_missing_key(path.name),)).fetchone():
+                # File kembali ke folder setelah sebelumnya dinonaktifkan otomatis -> aktifkan lagi.
+                c.execute("UPDATE knowledge_documents SET status='Aktif', updated_at=CURRENT_TIMESTAMP WHERE id=?", (r["document_id"],))
+                c.execute("DELETE FROM app_meta WHERE key=?", (_missing_key(path.name),))
+                if r["action"] == "unchanged":
+                    r["action"] = "reactivated"
+        results.append(r)
+    with connect() as c:
+        gone = c.execute("SELECT id, filename FROM knowledge_documents WHERE uploaded_by=? AND status='Aktif'", (tag,)).fetchall()
+        for d in gone:
+            if d["filename"] in present:
+                continue
+            c.execute("UPDATE knowledge_documents SET status='Nonaktif', updated_at=CURRENT_TIMESTAMP WHERE id=?", (d["id"],))
+            c.execute("INSERT INTO app_meta(key,value) VALUES(?,'1') ON CONFLICT(key) DO UPDATE SET value='1'", (_missing_key(d["filename"]),))
+            results.append({"filename": d["filename"], "document_id": d["id"], "action": "deactivated"})
+    invalidate_index()
     return results
 
 
@@ -500,7 +559,7 @@ def invalidate_index():
 
 
 def _index_key(c):
-    r = c.execute("SELECT COUNT(*) n, MAX(updated_at) u, SUM(LENGTH(body)+LENGTH(title)+LENGTH(IFNULL(keywords,''))+LENGTH(status)) s FROM knowledge").fetchone()
+    r = c.execute("SELECT COUNT(*) n, MAX(updated_at) u, SUM(LENGTH(body)+LENGTH(title)+LENGTH(IFNULL(keywords,''))+LENGTH(status)+IFNULL(rev,1)) s FROM knowledge").fetchone()
     d = c.execute("SELECT COUNT(*) n, MAX(updated_at) u, GROUP_CONCAT(status) s FROM knowledge_documents").fetchone()
     return (r["n"], r["u"], r["s"], d["n"], d["u"], d["s"])
 
@@ -512,7 +571,7 @@ def _build_index():
             if _index["key"] == key:
                 return _index
         rows = c.execute("""SELECT k.id,k.title,k.category,k.keywords,k.body,k.section,k.source_url,k.validity,
-                                   k.checked_at,k.document_id,d.title AS document_title
+                                   k.checked_at,k.document_id,k.rev,d.title AS document_title
                             FROM knowledge k LEFT JOIN knowledge_documents d ON d.id=k.document_id
                             WHERE k.status='Aktif' AND k.kind='fakta' AND (d.id IS NULL OR d.status='Aktif')""").fetchall()
     docs, df = [], Counter()
@@ -538,6 +597,20 @@ def _build_index():
     return _index
 
 
+def _idf_unique(n: int) -> float:
+    """IDF BM25 untuk kata yang hanya muncul di satu bagian dari n bagian."""
+    return math.log(1 + (max(n, 1) - 0.5) / 1.5)
+
+
+def effective_min_score(n_docs: int, min_score: float = KB_MIN_SCORE) -> float:
+    """Skor BM25 ikut mengecil bila knowledge aktif hanya berisi sedikit bagian (IDF kecil).
+    Ambang disesuaikan secara proporsional agar dokumen kecil tetap bisa menjawab;
+    untuk knowledge >= KB_SCORE_REF_DOCS bagian, ambang = KB_MIN_SCORE apa adanya."""
+    if n_docs >= KB_SCORE_REF_DOCS:
+        return min_score
+    return min_score * max(_idf_unique(n_docs) / _idf_unique(KB_SCORE_REF_DOCS), 0.35)
+
+
 def search(query: str, extra_query: str = "", top_k: int = KB_TOP_K, min_score: float = KB_MIN_SCORE,
            relative_cutoff: float = KB_RELATIVE_CUTOFF, debug: bool = False) -> list[dict]:
     idx = _build_index()
@@ -551,6 +624,7 @@ def search(query: str, extra_query: str = "", top_k: int = KB_TOP_K, min_score: 
     if not q_weights:
         return []
     N, k1, b = len(docs), 1.4, 0.6
+    min_score = effective_min_score(N, min_score)
     scored = []
     for d in docs:
         score, matched = 0.0, []
@@ -585,6 +659,7 @@ def _hit(score, matched, d, used):
     return {"id": d["id"], "title": d["title"], "category": d["category"], "section": d["section"],
             "body": d["body"], "source_url": d["source_url"], "validity": d["validity"],
             "checked_at": d["checked_at"], "document_id": d["document_id"], "document_title": d["document_title"],
+            "rev": d.get("rev") or 1,
             "score": round(score, 2), "matched": sorted(set(matched)), "used": used}
 
 
@@ -602,6 +677,27 @@ def instruction_chunks(limit_chars: int = 3500) -> str:
         text.append(block)
         total += len(block)
     return "\n\n".join(text)
+
+
+def active_org_names() -> list[str]:
+    """Organisasi dari dokumen yang sedang aktif (punya bagian fakta aktif)."""
+    with connect() as c:
+        rows = c.execute("""SELECT d.org_name, d.title, COUNT(k.id) n FROM knowledge_documents d
+                            JOIN knowledge k ON k.document_id=d.id AND k.status='Aktif' AND k.kind='fakta'
+                            WHERE d.status='Aktif' GROUP BY d.id ORDER BY n DESC""").fetchall()
+    names = []
+    for r in rows:
+        name = (r["org_name"] or "").strip() or guess_org(r["title"])
+        if name and name.lower() not in (x.lower() for x in names):
+            names.append(name)
+    return names
+
+
+def current_org() -> str:
+    """Nama organisasi untuk prompt & sapaan: diambil dari knowledge yang AKTIF,
+    sehingga ikut berganti saat knowledge diganti. ORG_NAME di .env hanya cadangan."""
+    names = active_org_names()
+    return " / ".join(names[:3]) if names else ORG_NAME
 
 
 def kb_stats() -> dict:
