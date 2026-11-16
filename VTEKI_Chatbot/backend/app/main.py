@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from . import agent, knowledge, llm
 from .config import (ASSISTANT_NAME, GEMINI_MODEL, GUARDRAIL_MAX_STRIKES, KNOWLEDGE_AUTO_SYNC, KNOWLEDGE_DIR,
-                     LLM_CLASSIFIER, MAX_UPLOAD_MB, ORG_NAME)
+                     LLM_CLASSIFIER, MAX_UPLOAD_MB)
 from .db import connect, init_db
 from .guardrails import describe
 from .security import admin_only, audit, create_token, current_user, hash_password, verify_password
@@ -30,6 +30,10 @@ def startup():
             if r.get('action') in ('created', 'replaced'):
                 log.info('Knowledge %s: %s (%s bagian, versi %s)', r['action'], r['filename'], r['chunks'], r['version'])
                 audit('system', f"Sinkron knowledge/{r['filename']}: {r['action']} v{r['version']} ({r['chunks']} bagian)")
+            elif r.get('action') in ('deactivated', 'reactivated'):
+                verb = 'dinonaktifkan (file tidak ada lagi di folder)' if r['action'] == 'deactivated' else 'diaktifkan kembali (file kembali ke folder)'
+                log.info('Knowledge %s %s', r['filename'], verb)
+                audit('system', f"Sinkron knowledge/{r['filename']}: {verb}")
             elif r.get('action') == 'error':
                 log.warning('Knowledge gagal diimpor: %s: %s', r['filename'], r.get('error'))
 
@@ -73,6 +77,7 @@ class DocumentPatch(BaseModel):
     status: Optional[str] = None
     source_url: Optional[str] = None
     checked_at: Optional[str] = None
+    org_name: Optional[str] = Field(default=None, max_length=120)
 
 
 class ImportTextBody(BaseModel):
@@ -119,8 +124,9 @@ def _loads(s):
 
 
 def _greeting():
-    return (f'Halo, saya {ASSISTANT_NAME} untuk informasi umum layanan {ORG_NAME}. '
-            f'Saya bukan kanal resmi {ORG_NAME} dan tidak dapat mengakses rekening Anda. Ada yang bisa saya bantu?')
+    org = knowledge.current_org()
+    return (f'Halo, saya {ASSISTANT_NAME} untuk informasi umum layanan {org}. '
+            f'Saya bukan kanal resmi {org} dan tidak dapat mengakses rekening Anda. Ada yang bisa saya bantu?')
 
 
 def _notify_admins(c, case_id, message):
@@ -134,7 +140,7 @@ def _notify_admins(c, case_id, message):
 @app.get('/api/health')
 def health():
     return {'status': 'ok', 'model': GEMINI_MODEL, 'gemini_configured': llm.is_configured(), 'router': 'langgraph',
-            'llm_classifier': LLM_CLASSIFIER, 'org': ORG_NAME, 'knowledge': knowledge.kb_stats()}
+            'llm_classifier': LLM_CLASSIFIER, 'org': knowledge.current_org(), 'knowledge': knowledge.kb_stats()}
 
 
 @app.post('/api/auth/register')
@@ -176,7 +182,7 @@ def login(body: LoginBody):
 
 @app.get('/api/auth/me')
 def me(user=Depends(current_user)):
-    return {'user': user, 'max_strikes': GUARDRAIL_MAX_STRIKES, 'org': ORG_NAME}
+    return {'user': user, 'max_strikes': GUARDRAIL_MAX_STRIKES, 'org': knowledge.current_org()}
 
 
 @app.post('/api/auth/logout')
@@ -274,9 +280,8 @@ def chat(body: ChatBody, user=Depends(current_user)):
         m = _loads(r['meta'])
         if r['sender'] == 'system' or m.get('flagged'):
             continue
-        src_ids = [s_['id'] for s_ in (m.get('sources') or [])]
-        if r['sender'] == 'assistant' and src_ids and not set(src_ids) <= knowledge.active_fact_ids(src_ids, r['created_at'] or ''):
-            continue  # jawaban lama dari knowledge yang sudah dihapus/diganti -> dilupakan AI
+        if r['sender'] == 'assistant' and not knowledge.sources_still_valid(m.get('sources') or [], r['created_at'] or ''):
+            continue  # jawaban lama dari knowledge yang sudah dihapus/dinonaktifkan/diedit -> dilupakan AI
         history.append({'sender': r['sender'], 'content': r['content']})
 
     state = agent.run_chat(user=fresh, case=case, message=message, history=history)
@@ -287,7 +292,7 @@ def chat(body: ChatBody, user=Depends(current_user)):
     reply = state.get('reply') or ''
     kind = state.get('reply_kind') or 'ai'
     hits = {h['id']: h for h in state.get('hits') or []}
-    sources = [{'id': i, 'title': hits[i]['title'], 'source_url': hits[i].get('source_url') or '',
+    sources = [{'id': i, 'title': hits[i]['title'], 'source_url': hits[i].get('source_url') or '', 'rev': hits[i].get('rev') or 1,
                 'document_title': hits[i].get('document_title') or ''} for i in state.get('source_ids') or [] if i in hits]
     status = _merge_status(case['status'], state.get('status'))
     priority = state.get('priority') or case['priority']
@@ -398,7 +403,7 @@ async def preview_knowledge(file: UploadFile = File(...), user=Depends(admin_onl
     parsed = knowledge.chunk_document(text, default_title=(file.filename or 'Dokumen').rsplit('.', 1)[0])
     with connect() as c:
         same = c.execute('SELECT id,title,version FROM knowledge_documents WHERE filename=? ORDER BY id DESC LIMIT 1', (file.filename,)).fetchone()
-    return {'title': parsed['title'], 'file_type': ftype, 'source_url': parsed['source_url'], 'checked_at': parsed['checked_at'],
+    return {'title': parsed['title'], 'file_type': ftype, 'source_url': parsed['source_url'], 'checked_at': parsed['checked_at'], 'org_name': parsed['org_name'],
             'existing': dict(same) if same else None,
             'chunks': [{k: ch[k] for k in ('title', 'kind', 'category', 'status', 'validity', 'source_url', 'keywords')} | {'chars': len(ch['body']), 'preview': ch['body'][:220]}
                        for ch in parsed['chunks']]}
@@ -419,7 +424,7 @@ def import_text(body: ImportTextBody, user=Depends(admin_only)):
 def list_documents(user=Depends(admin_only)):
     with connect() as c:
         rows = c.execute('''SELECT d.id,d.title,d.filename,d.file_type,d.version,d.status,d.chunk_count,d.source_url,d.checked_at,
-                                   d.uploaded_by,d.created_at,d.updated_at,
+                                   d.org_name,d.uploaded_by,d.created_at,d.updated_at,
                                    (SELECT COUNT(*) FROM knowledge k WHERE k.document_id=d.id AND k.status='Aktif' AND k.kind='fakta') active_facts,
                                    (SELECT COUNT(*) FROM knowledge k WHERE k.document_id=d.id AND k.kind='instruksi' AND k.status='Aktif') active_instructions
                             FROM knowledge_documents d ORDER BY d.updated_at DESC''').fetchall()
@@ -457,7 +462,7 @@ def patch_document(doc_id: int, body: DocumentPatch, user=Depends(admin_only)):
         if body.status not in ('Aktif', 'Nonaktif'):
             raise HTTPException(400, 'Status dokumen harus Aktif atau Nonaktif.')
         fields.append('status=?'); values.append(body.status)
-    for name in ('title', 'source_url', 'checked_at'):
+    for name in ('title', 'source_url', 'checked_at', 'org_name'):
         v = getattr(body, name)
         if v is not None:
             fields.append(f'{name}=?'); values.append(v.strip())
@@ -545,7 +550,7 @@ def update_knowledge(item_id: int, body: KnowledgeBody, user=Depends(admin_only)
     _validate_article(body)
     with connect() as c:
         cur = c.execute('''UPDATE knowledge SET title=?,category=?,keywords=?,body=?,status=?,kind=?,source_url=?,validity=?,
-                           updated_at=CURRENT_TIMESTAMP WHERE id=?''',
+                           rev=rev+1,updated_at=CURRENT_TIMESTAMP WHERE id=?''',
                         (body.title, body.category, body.keywords, body.body, body.status, body.kind, body.source_url, body.validity, item_id))
         if not cur.rowcount:
             raise HTTPException(404, 'Artikel tidak ditemukan.')
@@ -614,7 +619,7 @@ def dashboard(user=Depends(admin_only)):
     return {'total_cases': total, 'statuses': statuses, 'active_knowledge_articles': kb['active_chunks'], 'knowledge_documents': kb['documents'],
             'guardrail_pending': guard_pending, 'suspended_users': suspended, 'unread_notifications': unread,
             'recent_audit': audits, 'model': GEMINI_MODEL, 'gemini_configured': llm.is_configured(),
-            'llm_classifier': LLM_CLASSIFIER, 'router': 'LangGraph', 'org': ORG_NAME, 'max_strikes': GUARDRAIL_MAX_STRIKES}
+            'llm_classifier': LLM_CLASSIFIER, 'router': 'LangGraph', 'org': knowledge.current_org(), 'max_strikes': GUARDRAIL_MAX_STRIKES}
 
 
 @app.get('/api/admin/graph')

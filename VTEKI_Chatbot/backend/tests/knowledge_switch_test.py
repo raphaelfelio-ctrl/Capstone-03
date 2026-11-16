@@ -146,7 +146,9 @@ with TestClient(app) as client:
     check("panduan instruksi dokumen baru dipakai", "PANDUAN-SEJAHTERA-V1" in system)
     check("panduan instruksi dokumen BCA tidak dipakai", "Halo BCA" not in system.split("PANDUAN DARI DOKUMEN")[-1])
     r = chat("Apa itu SejahteraMobile?")
-    check("pertanyaan produk baru dijawab", r["status"] == "Selesai otomatis" and r["sources"], str(r))
+    check("pertanyaan produk baru dijawab (knowledge kecil, ambang menyesuaikan)", r["status"] == "Selesai otomatis" and r["sources"], str(r))
+    r = chat("berapa harga tiket pesawat ke bali")
+    check("knowledge kecil: pertanyaan tidak relevan tetap tidak dijawab", not r["sources"] and r["status"] == "Menunggu agen", str(r))
 
     print("4. Pertanyaan yang hanya ada di knowledge lama")
     r = chat("Apa itu KlikBCA?")
@@ -192,9 +194,8 @@ with TestClient(app) as client:
     r = chat("Berapa WhatsApp resmi?", case_s)
     _, prompt = last_generate()
     check("edit cepat (detik yang sama): jawaban tetap memakai isi baru", "0811-5555-1111" in r["reply"], r["reply"][:200])
-    note("edit cepat (detik yang sama): jawaban lama dibuang dari riwayat",
-         "0811-9999-0000" not in history_part(prompt),
-         "-> riwayat masih memuat isi sebelum edit (perbandingan updated_at hanya per detik)")
+    check("edit cepat (detik yang sama): jawaban lama dibuang dari riwayat",
+          "0811-9999-0000" not in history_part(prompt), history_part(prompt)[:400])
 
     print("8. Kembali ke knowledge BCA")
     set_status(new_id, "Nonaktif")
@@ -212,11 +213,20 @@ with TestClient(app) as client:
     chat("Berapa nomor call center?")
     system, _ = last_generate()
     rules = system.split("PANDUAN DARI DOKUMEN")[0]
-    note("aturan inti tidak menyebut organisasi lama saat knowledge diganti",
-         "BCA" not in rules,
-         f"-> prompt masih berisi: {sorted(set(re.findall(r'[A-Za-z]*BCA[A-Za-z]*', rules)))} (ORG_NAME di .env tidak ikut berganti)")
+    check("aturan inti memakai organisasi knowledge aktif", "Bank Sejahtera" in rules and "BCA" not in rules,
+          str(sorted(set(re.findall(r'[A-Za-z]*BCA[A-Za-z]*', rules)))))
     r = chat("halo")
-    note("sapaan menyebut organisasi knowledge aktif", "BCA" not in r["reply"], "-> sapaan: " + r["reply"][:120])
+    check("sapaan menyebut organisasi knowledge aktif", "Bank Sejahtera" in r["reply"] and "BCA" not in r["reply"], r["reply"][:120])
+    check("dasbor admin menampilkan organisasi aktif", client.get("/api/admin/dashboard", headers=A).json()["org"] == "Bank Sejahtera")
+    client.patch(f"/api/knowledge/documents/{new_id}", headers=A, json={"org_name": "Bank Sejahtera Makmur"})
+    chat("Berapa nomor call center?")
+    check("organisasi bisa diubah admin per dokumen", "Bank Sejahtera Makmur" in last_generate()[0])
+    set_status(new_id, "Nonaktif")
+    set_status(bca["id"], "Aktif")
+    r = chat("halo")
+    check("kembali ke BCA: sapaan menyebut BCA lagi", "BCA" in r["reply"] and "Sejahtera" not in r["reply"], r["reply"][:120])
+    set_status(bca["id"], "Nonaktif")
+    set_status(new_id, "Aktif")
 
     print("10. Dua dokumen aktif bersamaan (lupa menonaktifkan yang lama)")
     set_status(bca["id"], "Aktif")
@@ -236,10 +246,21 @@ with TestClient(app) as client:
     (folder / "Baru_KB.md").write_bytes(kb_doc("1500-222", "0811-2222-2222", app_name="BaruMobile"))
     knowledge.sync_knowledge_dir(folder)
     lama = next(d for d in docs() if d["filename"] == "Lama_KB.md")
-    note("file yang dihapus dari folder knowledge/ ikut nonaktif", lama["status"] != "Aktif",
-         "-> dokumen Lama_KB.md tetap Aktif di database dan tetap dipakai AI")
+    check("file yang dihapus dari folder knowledge/ ikut nonaktif", lama["status"] == "Nonaktif", str(lama))
     r = chat("Apa itu LamaMobile?")
-    note("AI tidak lagi menjawab dari file folder yang sudah dihapus", not r["sources"], f"-> sumber: {r['sources']}")
+    check("AI tidak lagi menjawab dari file folder yang sudah dihapus", not r["sources"], str(r["sources"]))
+    r = chat("Apa itu BaruMobile?")
+    check("AI menjawab dari file baru di folder", r["sources"] and r["status"] == "Selesai otomatis", str(r))
+    check("dokumen di folder lain (BCA) tidak tersentuh", next(d for d in docs() if d["id"] == bca["id"])["status"] == "Nonaktif")
+    (folder / "Lama_KB.md").write_bytes(kb_doc("1500-111", "0811-1111-1111", app_name="LamaMobile"))
+    res = knowledge.sync_knowledge_dir(folder)
+    check("file dikembalikan ke folder -> dokumen aktif lagi",
+          next(d for d in docs() if d["filename"] == "Lama_KB.md")["status"] == "Aktif", str(res))
+    baru = next(d for d in docs() if d["filename"] == "Baru_KB.md")
+    set_status(baru["id"], "Nonaktif")  # admin menonaktifkan manual
+    knowledge.sync_knowledge_dir(folder)
+    check("dokumen yang dinonaktifkan admin tidak dihidupkan oleh sinkron",
+          next(d for d in docs() if d["id"] == baru["id"])["status"] == "Nonaktif")
 
 print(f"\nHasil: {ok} lulus, {fail} gagal, {len(FINDINGS)} temuan")
 for f in FINDINGS:

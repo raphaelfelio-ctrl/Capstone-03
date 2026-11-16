@@ -40,7 +40,8 @@ LLM_CLASSIFIER = _bool("LLM_CLASSIFIER", True)
 # --- Aplikasi ---------------------------------------------------------------
 APP_SECRET = os.getenv("APP_SECRET", "dev-only-change-this-secret")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./vteki.db")
-# Nama organisasi yang dilayani knowledge base (dipakai pada sapaan & prompt).
+# Nama organisasi CADANGAN untuk sapaan & prompt. Nama utama diambil otomatis dari dokumen
+# knowledge yang aktif (baris "**Organisasi:** ..." atau judul "... Bank X").
 ORG_NAME = os.getenv("ORG_NAME", "BCA").strip() or "BCA"
 ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Asisten AI V-TEKI").strip() or "Asisten AI V-TEKI"
 
@@ -55,6 +56,9 @@ KB_TOP_K = _int("KB_TOP_K", 4)
 KB_MIN_SCORE = _float("KB_MIN_SCORE", 3.0)
 # Bagian lain ikut dipakai hanya bila skornya >= rasio ini x skor tertinggi.
 KB_RELATIVE_CUTOFF = _float("KB_RELATIVE_CUTOFF", 0.45)
+# KB_MIN_SCORE berlaku penuh bila knowledge aktif >= sekian bagian; untuk knowledge yang
+# lebih kecil ambang diturunkan proporsional (skor BM25 secara alami lebih kecil).
+KB_SCORE_REF_DOCS = _int("KB_SCORE_REF_DOCS", 20)
 MAX_UPLOAD_MB = _int("MAX_UPLOAD_MB", 5)
 CHUNK_MAX_CHARS = _int("CHUNK_MAX_CHARS", 1800)
 
