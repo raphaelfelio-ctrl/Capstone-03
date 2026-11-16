@@ -100,6 +100,22 @@ def init_db():
           created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS otp_challenges (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          session_token TEXT NOT NULL, code_hash TEXT NOT NULL, salt TEXT NOT NULL, expires_at TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+        );
+        -- Data rekening DEMO (fiktif). Tidak terhubung ke core banking.
+        CREATE TABLE IF NOT EXISTS bank_accounts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          account_number TEXT NOT NULL, product TEXT NOT NULL, holder_name TEXT NOT NULL,
+          balance INTEGER NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'IDR', status TEXT NOT NULL DEFAULT 'Aktif',
+          updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS bank_transactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES bank_accounts(id) ON DELETE CASCADE,
+          posted_at TEXT NOT NULL, description TEXT NOT NULL, amount INTEGER NOT NULL
+        );
         ''')
 
         # --- Migrasi kolom (aman dijalankan berulang) ---
@@ -118,6 +134,14 @@ def init_db():
         _add_column(c, 'knowledge', 'position', 'INTEGER NOT NULL DEFAULT 0')
         _add_column(c, 'knowledge', 'rev', 'INTEGER NOT NULL DEFAULT 1')            # naik tiap kali bagian diedit
         _add_column(c, 'knowledge_documents', 'org_name', "TEXT DEFAULT ''")      # organisasi pemilik knowledge
+        # Tingkat autentikasi (AL2/AL3) per sesi + faktor verifikasi per user
+        _add_column(c, 'sessions', 'al2_until', 'TEXT')
+        _add_column(c, 'sessions', 'al3_until', 'TEXT')
+        _add_column(c, 'users', 'phone', "TEXT DEFAULT ''")
+        _add_column(c, 'users', 'txn_pin_hash', "TEXT DEFAULT ''")
+        _add_column(c, 'users', 'pin_failed', 'INTEGER NOT NULL DEFAULT 0')
+        _add_column(c, 'users', 'pin_locked_until', 'TEXT')
+        _add_column(c, 'cases', 'verified_level', 'INTEGER NOT NULL DEFAULT 1')  # AL tertinggi customer di kasus ini
         c.execute('CREATE INDEX IF NOT EXISTS idx_knowledge_doc ON knowledge(document_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_messages_case ON messages(case_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_guard_case ON guardrail_events(case_id)')
@@ -138,3 +162,6 @@ def init_db():
         for email, name, role, password in demo:
             c.execute('INSERT OR IGNORE INTO users(email,name,role,password_hash) VALUES(?,?,?,?)',
                       (email, name, role, hash_password(password)))
+        # Data demo untuk verifikasi AL2/AL3: nomor HP, PIN transaksi, dan rekening fiktif.
+        from .identity import seed_demo
+        seed_demo(c)

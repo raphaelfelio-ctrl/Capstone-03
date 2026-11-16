@@ -7,12 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from . import agent, knowledge, llm
+from . import agent, identity, knowledge, llm
 from .config import (ASSISTANT_NAME, GEMINI_MODEL, GUARDRAIL_MAX_STRIKES, KNOWLEDGE_AUTO_SYNC, KNOWLEDGE_DIR,
                      LLM_CLASSIFIER, MAX_UPLOAD_MB)
 from .db import connect, init_db
 from .guardrails import describe
-from .security import admin_only, audit, create_token, current_user, hash_password, verify_password
+from .security import admin_only, audit, create_token, current_user, hash_password, public_user, verify_password
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger('vteki')
@@ -94,6 +94,16 @@ class DecisionBody(BaseModel):
     approve: bool
 
 
+class OtpConfirmBody(BaseModel):
+    challenge_id: int
+    code: str = Field(min_length=4, max_length=10)
+
+
+class PinBody(BaseModel):
+    pin: str = Field(min_length=4, max_length=12)
+    case_id: Optional[str] = None
+
+
 class ReviewBody(BaseModel):
     verdict: str = 'confirmed'  # confirmed | false_positive
 
@@ -163,7 +173,7 @@ def register(body: RegisterBody):
     audit(email, 'Registrasi akun customer berhasil')
     return {'access_token': token, 'token_type': 'bearer',
             'user': {'id': user_id, 'email': email, 'name': name, 'role': 'customer',
-                     'guardrail_strikes': 0, 'ai_suspended': 0}}
+                     'guardrail_strikes': 0, 'ai_suspended': 0, 'auth_level': 1}}
 
 
 @app.post('/api/auth/login')
@@ -177,12 +187,13 @@ def login(body: LoginBody):
     audit(row['email'], 'Login berhasil')
     return {'access_token': token, 'token_type': 'bearer',
             'user': {'id': row['id'], 'email': row['email'], 'name': row['name'], 'role': row['role'],
-                     'guardrail_strikes': row['guardrail_strikes'], 'ai_suspended': row['ai_suspended']}}
+                     'guardrail_strikes': row['guardrail_strikes'], 'ai_suspended': row['ai_suspended'], 'auth_level': 1}}
 
 
 @app.get('/api/auth/me')
 def me(user=Depends(current_user)):
-    return {'user': user, 'max_strikes': GUARDRAIL_MAX_STRIKES, 'org': knowledge.current_org()}
+    return {'user': public_user(user), 'max_strikes': GUARDRAIL_MAX_STRIKES, 'org': knowledge.current_org(),
+            'auth': identity.level_info(user) if user['role'] == 'customer' else None}
 
 
 @app.post('/api/auth/logout')
@@ -192,6 +203,100 @@ def logout(user=Depends(current_user), authorization: str | None = Header(defaul
         c.execute('DELETE FROM sessions WHERE token=?', (token,))
     audit(user['email'], 'Logout')
     return {'ok': True}
+
+
+# ---------------------------------------------------------------------------
+# Tingkat autentikasi (AL0-AL3) & data rekening
+# ---------------------------------------------------------------------------
+def _customer_only(user):
+    if user['role'] != 'customer':
+        raise HTTPException(400, 'Verifikasi identitas hanya untuk akun customer.')
+
+
+def _auth_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except identity.AuthError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+
+
+@app.get('/api/auth/levels')
+def auth_levels():
+    """Kebijakan tingkat autentikasi (publik)."""
+    return {'levels': [{'level': k, **v} for k, v in identity.LEVELS.items()], 'required': identity.REQUIRED_LEVEL}
+
+
+@app.get('/api/auth/level')
+def auth_level(user=Depends(current_user)):
+    _customer_only(user)
+    return identity.level_info(user)
+
+
+@app.post('/api/auth/verify/otp/request')
+def otp_request(user=Depends(current_user)):
+    _customer_only(user)
+    r = _auth_call(identity.request_otp, user)
+    audit(user['email'], f"Meminta OTP verifikasi AL2 ({r['channel']})")
+    return r
+
+
+@app.post('/api/auth/verify/otp/confirm')
+def otp_confirm(body: OtpConfirmBody, user=Depends(current_user)):
+    _customer_only(user)
+    try:
+        identity.confirm_otp(user, body.challenge_id, body.code)
+    except identity.AuthError as exc:
+        audit(user['email'], f'Verifikasi OTP gagal: {exc}')
+        raise HTTPException(exc.status, str(exc)) from exc
+    audit(user['email'], 'Verifikasi OTP berhasil: sesi naik ke AL2')
+    return identity.level_info(current_user(f"Bearer {user['session_token']}"))
+
+
+@app.post('/api/auth/verify/pin')
+def pin_verify(body: PinBody, user=Depends(current_user)):
+    _customer_only(user)
+    try:
+        r = identity.verify_pin(user, body.pin, body.case_id)
+    except identity.AuthError as exc:
+        audit(user['email'], f'Verifikasi PIN gagal: {exc}')
+        if getattr(exc, 'locked_now', False):
+            with connect() as c:
+                _notify_admins(c, body.case_id, f"🔐 PIN transaksi {user['name']} ({user['email']}) salah berulang; "
+                                                "verifikasi dikunci sementara.")
+        raise HTTPException(exc.status, str(exc)) from exc
+    audit(user['email'], 'Verifikasi PIN berhasil: sesi naik ke AL3' + (f" (kasus {', '.join(r['cases_verified'])})" if r['cases_verified'] else ''))
+    return {**identity.level_info(current_user(f"Bearer {user['session_token']}")), 'cases_verified': r['cases_verified']}
+
+
+@app.post('/api/auth/verify/revoke')
+def verify_revoke(user=Depends(current_user)):
+    _customer_only(user)
+    identity.revoke(user)
+    audit(user['email'], 'Mengakhiri verifikasi identitas (kembali ke AL1)')
+    return identity.level_info(current_user(f"Bearer {user['session_token']}"))
+
+
+def _require_level(user, level):
+    if user['role'] != 'customer' or user['auth_level'] < level:
+        raise HTTPException(403, f'Perlu verifikasi identitas {identity.LEVELS[level]["code"]} '
+                                 f'({identity.LEVELS[level]["how"]}).')
+
+
+@app.get('/api/accounts')
+def my_accounts(user=Depends(current_user)):
+    _require_level(user, 2)
+    items = identity.accounts(user['id'])
+    audit(user['email'], f'Melihat saldo rekening (AL{user["auth_level"]})')
+    return {'items': [{k: a[k] for k in ('id', 'account_masked', 'product', 'holder_name', 'balance', 'balance_text', 'currency', 'status', 'updated_at')}
+                      for a in items]}
+
+
+@app.get('/api/accounts/{account_id}/transactions')
+def my_transactions(account_id: int, user=Depends(current_user)):
+    _require_level(user, 2)
+    items = _auth_call(identity.transactions, user['id'], account_id, 10)
+    audit(user['email'], f'Melihat mutasi rekening #{account_id} (AL{user["auth_level"]})')
+    return {'items': items}
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +349,7 @@ def get_messages(case_id: str, user):
         d = dict(r)
         meta = _loads(d.pop('meta'))
         if user['role'] != 'admin':  # detail internal hanya untuk admin
-            meta = {k: v for k, v in meta.items() if k in ('kind', 'sources', 'masked')}
+            meta = {k: v for k, v in meta.items() if k in ('kind', 'sources', 'masked', 'auth_required', 'private')}
         d['meta'] = meta
         items.append(d)
     return {'items': items}
@@ -278,13 +383,13 @@ def chat(body: ChatBody, user=Depends(current_user)):
     history = []
     for r in rows:
         m = _loads(r['meta'])
-        if r['sender'] == 'system' or m.get('flagged'):
-            continue
+        if r['sender'] == 'system' or m.get('flagged') or m.get('private'):
+            continue  # pesan sistem, manipulasi, dan data rekening tidak pernah dikirim ke LLM
         if r['sender'] == 'assistant' and not knowledge.sources_still_valid(m.get('sources') or [], r['created_at'] or ''):
             continue  # jawaban lama dari knowledge yang sudah dihapus/dinonaktifkan/diedit -> dilupakan AI
         history.append({'sender': r['sender'], 'content': r['content']})
 
-    state = agent.run_chat(user=fresh, case=case, message=message, history=history)
+    state = agent.run_chat(user=fresh, case=case, message=message, history=history, auth_level=user['auth_level'])
 
     esc = state.get('escalation')
     sensitive = state.get('sensitive') or []
@@ -307,17 +412,23 @@ def chat(body: ChatBody, user=Depends(current_user)):
     with connect() as c:
         c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
                   (case_id, 'customer', stored_message, json.dumps({'flagged': bool(esc), 'masked': sensitive}, ensure_ascii=False)))
-        c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
-                  (case_id, 'system' if kind in ('warning', 'system') else 'assistant', reply,
-                   json.dumps({'kind': kind, 'sources': sources, 'route': trace, 'intent': state.get('intent'),
+        private = kind == 'account'
+        # Data rekening hanya dikirim di respons ini; riwayat menyimpan penanda saja.
+        stored_reply = ('🔒 Informasi rekening ditampilkan untuk customer yang terverifikasi '
+                        f'(AL{user["auth_level"]}). Datanya tidak disimpan di riwayat percakapan.') if private else reply
+        cur_msg = c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
+                  (case_id, 'system' if kind in ('warning', 'system') else 'assistant', stored_reply,
+                   json.dumps({'kind': kind, 'sources': sources, 'private': private, 'auth_level': user['auth_level'],
+                               'auth_required': state.get('auth_required') or 0, 'route': trace, 'intent': state.get('intent'),
                                'classifier': state.get('classifier'), 'handoff': state.get('handoff_reason', ''),
                                'retrieved': [{'id': h['id'], 'title': h['title'], 'score': h['score']} for h in hits.values()],
                                'output_problems': state.get('output_problems') or []}, ensure_ascii=False)))
         subject = case['subject'] if case['subject'] not in ('Percakapan baru', '') else stored_message[:120]
         c.execute('''UPDATE cases SET subject=?,intent=?,status=?,priority=?,risk=?,handoff_reason=?,
-                     flagged=MAX(flagged,?),ai_locked=MAX(ai_locked,?),updated_at=CURRENT_TIMESTAMP WHERE id=?''',
+                     flagged=MAX(flagged,?),ai_locked=MAX(ai_locked,?),verified_level=MAX(verified_level,?),
+                     updated_at=CURRENT_TIMESTAMP WHERE id=?''',
                   (subject, intent, status, priority, risk, state.get('handoff_reason') or case.get('handoff_reason') or '',
-                   1 if esc else 0, 1 if esc else 0, case_id))
+                   1 if esc else 0, 1 if esc else 0, user['auth_level'], case_id))
 
         if esc:
             c.execute('''INSERT INTO guardrail_events(case_id,user_id,stage,score,reasons,message,action)
@@ -351,7 +462,8 @@ def chat(body: ChatBody, user=Depends(current_user)):
                          + (f"; GUARDRAIL={','.join(esc['reasons'])}" if esc else ''))
     return {
         'case_id': case_id, 'reply': reply, 'reply_kind': kind, 'status': status, 'intent': intent, 'risk': bool(risk),
-        'sources': sources, 'warning': bool(esc), 'masked': sensitive,
+        'sources': sources, 'warning': bool(esc), 'masked': sensitive, 'message_id': cur_msg.lastrowid,
+        'auth_level': user['auth_level'], 'auth_required': state.get('auth_required') or 0,
         'strikes': esc['strikes'] if esc else fresh['guardrail_strikes'],
         'ai_suspended': bool(esc and esc['suspended']) or bool(fresh['ai_suspended']), 'max_strikes': GUARDRAIL_MAX_STRIKES,
     }
@@ -641,6 +753,9 @@ def decide(case_id: str, body: DecisionBody, user=Depends(admin_only)):
     case = _visible_case(case_id, user)
     if case['status'] != 'Menunggu persetujuan':
         raise HTTPException(409, 'Kasus tidak sedang menunggu persetujuan.')
+    if body.approve and int(case.get('verified_level') or 1) < identity.REQUIRED_LEVEL['account_action']:
+        raise HTTPException(409, 'Customer belum terverifikasi AL3 (OTP + PIN transaksi) untuk permintaan ini. '
+                                 'Minta customer menyelesaikan verifikasi, atau tolak permintaan.')
     status = 'Selesai' if body.approve else 'Ditolak'
     answer = ('Permintaan disetujui untuk ditindaklanjuti. Catatan demo: persetujuan ini tidak terhubung ke sistem transaksi bank.'
               if body.approve else 'Permintaan belum disetujui. Agen customer service akan menindaklanjuti.')
@@ -648,7 +763,7 @@ def decide(case_id: str, body: DecisionBody, user=Depends(admin_only)):
         c.execute('UPDATE cases SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', (status, case_id))
         c.execute('INSERT INTO messages(case_id,sender,content) VALUES(?,?,?)', (case_id, 'agent', answer))
         c.execute('INSERT INTO notifications(user_id,case_id,message) VALUES(?,?,?)', (case['user_id'], case_id, f'Tiket {case_id}: {status}. {answer}'))
-    audit(user['email'], f'{"Menyetujui" if body.approve else "Menolak"} {case_id}')
+    audit(user['email'], f'{"Menyetujui" if body.approve else "Menolak"} {case_id} (customer AL{case.get("verified_level") or 1})')
     return {'ok': True, 'case_id': case_id, 'status': status}
 
 

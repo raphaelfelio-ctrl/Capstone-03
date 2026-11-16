@@ -70,3 +70,14 @@ GUARDRAIL_MAX_STRIKES = _int("GUARDRAIL_MAX_STRIKES", 3)
 GUARDRAIL_SCORE_THRESHOLD = _int("GUARDRAIL_SCORE_THRESHOLD", 3)
 # Keyakinan minimal LLM untuk menandai manipulasi yang tidak tertangkap pola.
 GUARDRAIL_LLM_CONFIDENCE = _float("GUARDRAIL_LLM_CONFIDENCE", 0.8)
+
+# --- Tingkat autentikasi customer (AL0-AL3), lihat identity.py ---------------
+AL2_TTL_MIN = _int("AL2_TTL_MIN", 15)          # masa berlaku verifikasi OTP (AL2)
+AL3_TTL_MIN = _int("AL3_TTL_MIN", 5)           # masa berlaku verifikasi PIN (AL3)
+OTP_TTL_SEC = _int("OTP_TTL_SEC", 180)         # masa berlaku satu kode OTP
+OTP_MAX_ATTEMPTS = _int("OTP_MAX_ATTEMPTS", 3)  # salah sekian kali -> kode hangus
+OTP_MAX_REQUESTS = _int("OTP_MAX_REQUESTS", 3)  # maks. permintaan OTP per 10 menit
+PIN_MAX_ATTEMPTS = _int("PIN_MAX_ATTEMPTS", 3)  # salah sekian kali -> PIN dikunci
+PIN_LOCK_MIN = _int("PIN_LOCK_MIN", 15)
+# Prototipe tanpa SMS gateway: kode OTP ditampilkan di layar. WAJIB false di produksi.
+OTP_DEMO_MODE = _bool("OTP_DEMO_MODE", True)
