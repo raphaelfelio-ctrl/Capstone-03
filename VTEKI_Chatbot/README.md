@@ -16,6 +16,7 @@ Prototipe customer service AI. Stack: **FastAPI + SQLite + Gemini API + LangGrap
 | **Output guard** | Jawaban AI diblok bila menyebut nomor/URL yang tidak ada di knowledge, meminta OTP/PIN, mengaku sudah memblokir/refund, atau membocorkan instruksi. |
 | **Masking data rahasia** | OTP, PIN, password, CVV, dan nomor kartu (cek Luhn) disamarkan sebelum disimpan atau dikirim ke Gemini. |
 | **Routing LangGraph** | Lihat diagram di bawah. Rute tiap pesan terlihat oleh admin di halaman Kasus. |
+| **Autentikasi AL0–AL3** | Customer membuktikan dirinya (OTP, PIN transaksi) sebelum melihat saldo/mutasi atau mengajukan tindakan berisiko. Lihat bagian 4b. |
 
 ## 1. Instalasi (Windows)
 
@@ -41,7 +42,7 @@ Terminal kedua: `cd frontend` lalu `py -m http.server 5500`, buka http://127.0.0
 | Peran | Email | Kata sandi |
 |---|---|---|
 | Admin | `admin@vteki.id` | `admin123` |
-| Customer | `customer@vteki.id` | `cust1234` |
+| Customer | `customer@vteki.id` | `cust1234` (HP demo `081234567890`, **PIN transaksi `246810`**, rekening demo saldo Rp 12.450.000) |
 
 ## 3. Mengelola knowledge
 
@@ -84,6 +85,11 @@ flowchart TD
     IG --> C[classify: Gemini / aturan]
     C -- manipulasi halus --> E
     C -- sapaan / di luar topik --> T[respond_template]
+    C -- saldo / mutasi pribadi --> AC{auth_check}
+    AC -- sesi < AL2 --> SU[step_up: minta verifikasi]
+    AC -- sesi >= AL2 --> AD[account_data: baca DB, tanpa Gemini]
+    SU --> F
+    AD --> F
     C --> R[retrieve: BM25 knowledge]
     R -- tidak ada knowledge --> N[no_answer: tidak menebak]
     R --> GEN[generate: Gemini JSON grounded]
@@ -102,6 +108,28 @@ flowchart TD
 | Laporan penipuan / kartu hilang | Menunggu agen (prioritas tinggi, risiko) |
 | Permintaan tindakan (blokir, refund, ubah data) | Menunggu persetujuan |
 | Upaya manipulasi AI | **Dialihkan ke admin** (AI dikunci di kasus itu) |
+| Info rekening pribadi (saldo/mutasi) | AL2+: Selesai otomatis · di bawah AL2: status tidak berubah, diminta verifikasi |
+
+## 4b. Tingkat autentikasi customer (AL0–AL3)
+
+| Level | Cara mencapai | Boleh | Masa berlaku |
+|---|---|---|---|
+| **AL0** Anonim | belum login | tidak bisa chat (API membalas 401) | – |
+| **AL1** Login akun | email + kata sandi | info umum dari knowledge, membuat & melihat tiket sendiri | selama sesi |
+| **AL2** Terverifikasi OTP | AL1 + kode OTP 6 digit ke nomor HP terdaftar | lihat **saldo & mutasi rekening milik sendiri** | 15 menit |
+| **AL3** Terverifikasi kuat | AL2 + PIN transaksi | ajukan tindakan berisiko (blokir, ubah data, refund) yang **bisa disetujui admin** | 5 menit |
+
+Cara pakai (customer): tanya "Berapa saldo rekening saya?" → AI meminta verifikasi → klik **Verifikasi identitas** (atau lencana 🛡 AL di kanan atas) → **Kirim kode OTP** → masukkan kode → pertanyaan dikirim ulang otomatis dan saldo tampil. Untuk "Tolong blokir kartu saya", lanjutkan ke langkah PIN (AL3); tanpa AL3 tombol **Setujui** di menu Persetujuan admin terkunci.
+
+Pengaman yang diterapkan:
+- Level disimpan **per sesi login** di server, bukan dari isi chat. Klaim "saya sudah terverifikasi" di chat tidak berpengaruh; logout/login ulang kembali ke AL1.
+- OTP & PIN dimasukkan di dialog khusus, **tidak pernah lewat chat** dan tidak dikirim ke Gemini. OTP & PIN disimpan sebagai hash.
+- OTP terikat ke sesi yang memintanya, berlaku 3 menit, hangus setelah 3x salah, maks. 3 permintaan per 10 menit.
+- PIN salah 3x → verifikasi PIN dikunci 15 menit, verifikasi sesi dicabut, admin dinotifikasi.
+- Data rekening dibaca kode langsung dari database (node `account_data`), **tidak pernah dikirim ke Gemini**, nomor rekening disamarkan, dan **tidak disimpan di riwayat chat** (riwayat hanya menyimpan penanda; admin pun tidak melihat saldonya).
+- Setiap verifikasi & akses saldo tercatat di Audit Trail.
+
+> **Mode demo:** tanpa SMS gateway, kode OTP ditampilkan di layar (`OTP_DEMO_MODE=true`). Rekening & transaksi adalah data fiktif (tabel `bank_accounts`, `bank_transactions`). Untuk produksi: set `OTP_DEMO_MODE=false`, kirim OTP lewat SMS/WhatsApp gateway, dan ganti data demo dengan integrasi core banking.
 
 Status "menunggu" tidak turun kembali ke "Selesai otomatis" hanya karena customer bertanya hal lain.
 
@@ -124,6 +152,10 @@ Status "menunggu" tidak turun kembali ke "Selesai otomatis" hanya karena custome
 | `GUARDRAIL_MAX_STRIKES` | `3` | Batas peringatan sebelum AI dinonaktifkan untuk customer. |
 | `KNOWLEDGE_AUTO_SYNC` | `true` | Impor otomatis isi folder `knowledge/` saat start. |
 | `MAX_UPLOAD_MB` | `5` | Batas ukuran file unggahan. |
+| `OTP_DEMO_MODE` | `true` | Tampilkan kode OTP di layar (prototipe tanpa SMS gateway). **Wajib `false` di produksi.** |
+| `AL2_TTL_MIN` / `AL3_TTL_MIN` | `15` / `5` | Masa berlaku verifikasi OTP / PIN. |
+| `OTP_TTL_SEC`, `OTP_MAX_ATTEMPTS`, `OTP_MAX_REQUESTS` | `180`, `3`, `3` | Masa berlaku kode, batas salah, batas permintaan per 10 menit. |
+| `PIN_MAX_ATTEMPTS` / `PIN_LOCK_MIN` | `3` / `15` | Batas PIN salah dan lama penguncian. |
 
 ## 7. Pengujian
 
@@ -138,6 +170,12 @@ Uji pergantian knowledge (40 uji: ganti dokumen, versi baru, edit bagian, riwaya
 
 ```powershell
 .\.venv\Scripts\python.exe -m tests.knowledge_switch_test
+```
+
+Uji routing & autentikasi AL0–AL3 (57 uji: rute tiap jenis pesan, OTP/PIN, kedaluwarsa, penguncian, isolasi data antar customer, data rekening tidak sampai ke Gemini):
+
+```powershell
+.\.venv\Scripts\python.exe -m tests.routing_auth_test
 ```
 
 ### Mengganti knowledge dengan aman
@@ -158,6 +196,7 @@ VTEKI_Chatbot/
     └── app/
         ├── main.py                 # REST API & penyimpanan hasil
         ├── agent.py                # graph LangGraph + prompt
+        ├── identity.py             # tingkat autentikasi AL0–AL3, OTP, PIN, data rekening demo
         ├── knowledge.py            # parser file, chunking, BM25
         ├── guardrails.py           # deteksi manipulasi, masking, output guard
         ├── llm.py                  # pembungkus Gemini (JSON + model cadangan)
@@ -178,6 +217,10 @@ VTEKI_Chatbot/
 | `GET /api/admin/guardrail` · `POST /api/admin/guardrail/{id}/review` | Kejadian guardrail & tinjauan |
 | `POST /api/admin/users/{id}/restore-ai` · `POST /api/admin/cases/{id}/unlock-ai` | Pulihkan akses AI |
 | `GET /api/admin/graph` | Diagram LangGraph (Mermaid) |
+| `GET /api/auth/levels` · `GET /api/auth/level` | Kebijakan AL0–AL3 · level sesi saat ini |
+| `POST /api/auth/verify/otp/request` · `…/otp/confirm` | Minta & konfirmasi OTP → AL2 |
+| `POST /api/auth/verify/pin` · `…/revoke` | PIN transaksi → AL3 · akhiri verifikasi |
+| `GET /api/accounts` · `GET /api/accounts/{id}/transactions` | Saldo & mutasi rekening sendiri (wajib AL2) |
 
 Endpoint lama tetap tersedia. Dokumentasi interaktif: http://127.0.0.1:8000/docs
 

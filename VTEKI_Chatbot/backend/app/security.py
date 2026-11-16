@@ -25,11 +25,20 @@ def current_user(authorization: str | None = Header(default=None)):
         raise HTTPException(401, 'Silakan login terlebih dahulu.')
     token = authorization[7:].strip()
     with connect() as c:
-        row = c.execute('''SELECT u.id,u.email,u.name,u.role,u.guardrail_strikes,u.ai_suspended FROM sessions s
+        row = c.execute('''SELECT u.id,u.email,u.name,u.role,u.guardrail_strikes,u.ai_suspended,
+                                  s.token AS session_token, s.al2_until, s.al3_until FROM sessions s
                            JOIN users u ON u.id=s.user_id WHERE s.token=?''', (token,)).fetchone()
     if not row:
         raise HTTPException(401, 'Sesi tidak valid. Silakan login kembali.')
-    return dict(row)
+    from .identity import session_level
+    user = dict(row)
+    user['auth_level'] = session_level(user)  # AL1 (login) .. AL3, dihitung ulang tiap permintaan
+    return user
+
+
+def public_user(user: dict) -> dict:
+    """Data user yang aman dikirim ke browser (tanpa token sesi)."""
+    return {k: v for k, v in user.items() if k not in ('session_token', 'al2_until', 'al3_until')}
 
 def admin_only(user=Depends(current_user)):
     if user['role'] != 'admin':
