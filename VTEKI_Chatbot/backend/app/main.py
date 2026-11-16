@@ -2,17 +2,18 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from . import agent, identity, knowledge, llm
-from .config import (ASSISTANT_NAME, GEMINI_MODEL, GUARDRAIL_MAX_STRIKES, KNOWLEDGE_AUTO_SYNC, KNOWLEDGE_DIR,
-                     LLM_CLASSIFIER, MAX_UPLOAD_MB)
+from . import agent, crm, identity, knowledge, llm, ratelimit, taxonomy
+from .config import (ASSISTANT_NAME, GUARDRAIL_MAX_STRIKES, KNOWLEDGE_AUTO_SYNC, KNOWLEDGE_DIR, LLM_CLASSIFIER,
+                     MAX_UPLOAD_MB, RATE_CHAT_PER_MIN, RATE_GUEST_PER_MIN)
 from .db import connect, init_db
 from .guardrails import describe
-from .security import admin_only, audit, create_token, current_user, hash_password, public_user, verify_password
+from .security import (admin_only, audit, create_token, current_user, hash_password, public_user, supervisor_only,
+                       verify_password)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger('vteki')
@@ -97,6 +98,19 @@ class DecisionBody(BaseModel):
 class OtpConfirmBody(BaseModel):
     challenge_id: int
     code: str = Field(min_length=4, max_length=10)
+    case_id: Optional[str] = None
+
+
+class OtpRequestBody(BaseModel):
+    phone: str = ''            # wajib untuk sesi tamu (AL0): identifikasi lewat nomor HP terdaftar
+
+
+class GuestBody(BaseModel):
+    channel: str = 'web'       # web | whatsapp
+
+
+
+
 
 
 class PinBody(BaseModel):
@@ -110,6 +124,8 @@ class ReviewBody(BaseModel):
 
 class AgentReplyBody(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    copilot_used: bool = False
+    awaiting_customer: bool = False   # True -> tiket "Menunggu Nasabah" (SLA dijeda)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +155,12 @@ def _greeting():
             f'Saya bukan kanal resmi {org} dan tidak dapat mengakses rekening Anda. Ada yang bisa saya bantu?')
 
 
+def _limit(key: str, limit: int):
+    ok, wait = ratelimit.hit(key, limit)
+    if not ok:
+        raise HTTPException(429, f'Terlalu banyak permintaan. Coba lagi dalam {wait} detik.')
+
+
 def _notify_admins(c, case_id, message):
     for a in c.execute("SELECT id FROM users WHERE role='admin'").fetchall():
         c.execute('INSERT INTO notifications(user_id,case_id,message) VALUES(?,?,?)', (a['id'], case_id, message[:500]))
@@ -149,7 +171,7 @@ def _notify_admins(c, case_id, message):
 # ---------------------------------------------------------------------------
 @app.get('/api/health')
 def health():
-    return {'status': 'ok', 'model': GEMINI_MODEL, 'gemini_configured': llm.is_configured(), 'router': 'langgraph',
+    return {'status': 'ok', 'model': llm.active_model(), 'llm_provider': llm.provider_chain(), 'gemini_configured': llm.is_configured(), 'router': 'langgraph',
             'llm_classifier': LLM_CLASSIFIER, 'org': knowledge.current_org(), 'knowledge': knowledge.kb_stats()}
 
 
@@ -232,23 +254,70 @@ def auth_level(user=Depends(current_user)):
     return identity.level_info(user)
 
 
+@app.post('/api/auth/guest')
+def guest_session(body: GuestBody, request: Request):
+    """AL0: sesi tamu tanpa login (web chat / simulator WhatsApp). Hanya FAQ sampai identitas diverifikasi OTP."""
+    _limit(f"guest:{request.client.host if request.client else '-'}", RATE_GUEST_PER_MIN)
+    channel = body.channel if body.channel in ('web', 'whatsapp') else 'web'
+    uid, token = identity.create_guest(channel)
+    audit('tamu', f'Sesi tamu AL0 dibuat (kanal {channel})')
+    return {'access_token': token, 'token_type': 'bearer',
+            'user': {'id': uid, 'email': '', 'name': 'Tamu', 'role': 'customer', 'is_guest': 1, 'channel': channel,
+                     'guardrail_strikes': 0, 'ai_suspended': 0, 'auth_level': 0}}
+
+
 @app.post('/api/auth/verify/otp/request')
-def otp_request(user=Depends(current_user)):
+def otp_request(body: Optional[OtpRequestBody] = None, user=Depends(current_user)):
     _customer_only(user)
-    r = _auth_call(identity.request_otp, user)
+    r = _auth_call(identity.request_otp, user, (body.phone if body else ''))
     audit(user['email'], f"Meminta OTP verifikasi AL2 ({r['channel']})")
     return r
+
+
+def _handoff_case(c, case_id: str, *, reason: str, auth_level: int, actor: str, ai_actions: list[str]):
+    """Alihkan kasus ke agen manusia: status, tiket, dan paket konteks 17 field."""
+    case = dict(c.execute('SELECT * FROM cases WHERE id=?', (case_id,)).fetchone())
+    code = case.get('intent_code') or 'minta_agen'
+    conf = float(case.get('intent_confidence') or 0)
+    tk = crm.create_or_update_ticket(c, case=case, intent_code=code, confidence=conf, sentiment=case.get('sentiment') or 'netral',
+                                     urgency='tinggi', status='Menunggu Agen', actor=actor, note=crm.REASON_LABEL.get(reason, reason))
+    c.execute("""UPDATE cases SET status=CASE WHEN status IN ('Menunggu persetujuan','Dialihkan ke admin') THEN status ELSE 'Menunggu agen' END,
+                 priority='Tinggi', handoff_reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (reason, case_id))
+    pkg = crm.build_handoff(c, case_id=case_id, ticket=tk, reason=reason, auth_level=auth_level, intent_code=code, confidence=conf,
+                            sentiment=case.get('sentiment') or 'netral', urgency='tinggi', ai_actions=ai_actions)
+    _notify_admins(c, case_id, f"Handoff {pkg['handoff_id']} untuk {case_id}: {crm.REASON_LABEL.get(reason, reason)}.")
+    return tk, pkg
+
+
+def _latest_open_case(c, user_id: int, case_id: Optional[str]):
+    if case_id:
+        row = c.execute("SELECT id FROM cases WHERE id=? AND user_id=?", (case_id, user_id)).fetchone()
+        if row:
+            return row['id']
+    row = c.execute("SELECT id FROM cases WHERE user_id=? AND status NOT IN ('Selesai','Ditolak') ORDER BY updated_at DESC LIMIT 1",
+                    (user_id,)).fetchone()
+    return row['id'] if row else None
 
 
 @app.post('/api/auth/verify/otp/confirm')
 def otp_confirm(body: OtpConfirmBody, user=Depends(current_user)):
     _customer_only(user)
     try:
-        identity.confirm_otp(user, body.challenge_id, body.code)
+        r = identity.confirm_otp(user, body.challenge_id, body.code)
     except identity.AuthError as exc:
         audit(user['email'], f'Verifikasi OTP gagal: {exc}')
+        if getattr(exc, 'locked_now', False):
+            # Spesifikasi §3.1(4): gagal OTP 3x berturut-turut -> sesi dikunci 15 menit & dialihkan ke agen manusia.
+            with connect() as c:
+                case_id = _latest_open_case(c, user['id'], body.case_id) or _new_case(user, 'Verifikasi OTP gagal')
+                c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
+                          (case_id, 'system', str(exc), json.dumps({'kind': 'system'})))
+                _handoff_case(c, case_id, reason='otp_gagal_3x', auth_level=user['auth_level'], actor='Sistem',
+                              ai_actions=['Verifikasi OTP gagal 3x berturut-turut', 'Sesi verifikasi dikunci 15 menit'])
+            audit(user['email'], 'Sesi dikunci 15 menit & dialihkan ke agen (OTP gagal 3x)')
         raise HTTPException(exc.status, str(exc)) from exc
-    audit(user['email'], 'Verifikasi OTP berhasil: sesi naik ke AL2')
+    audit(user['email'] if not r.get('linked_user_id') else f"tamu->user#{r['linked_user_id']}",
+          'Verifikasi OTP berhasil: sesi naik ke AL2' + (' (sesi tamu ditautkan ke nasabah)' if r.get('linked_user_id') else ''))
     return identity.level_info(current_user(f"Bearer {user['session_token']}"))
 
 
@@ -312,11 +381,12 @@ def _visible_case(case_id, user):
     return dict(row)
 
 
-def _new_case(user, subject='Percakapan baru'):
+def _new_case(user, subject='Percakapan baru', channel: str = ''):
     with connect() as c:
         latest = c.execute("SELECT MAX(CAST(SUBSTR(id,5) AS INTEGER)) FROM cases WHERE id LIKE 'CAS-%'").fetchone()[0] or 1000
         case_id = f'CAS-{latest + 1}'
-        c.execute('INSERT INTO cases(id,user_id,subject) VALUES(?,?,?)', (case_id, user['id'], subject[:200]))
+        c.execute('INSERT INTO cases(id,user_id,subject,channel,verified_level) VALUES(?,?,?,?,?)',
+                  (case_id, user['id'], subject[:200], channel or user.get('channel') or 'web', int(user.get('auth_level') or 0)))
         c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
                   (case_id, 'assistant', _greeting(), json.dumps({'kind': 'template'})))
     return case_id
@@ -370,21 +440,26 @@ def chat(body: ChatBody, user=Depends(current_user)):
         raise HTTPException(400, 'Pesan tidak boleh kosong.')
     if user['role'] == 'admin':
         raise HTTPException(400, 'Admin membalas lewat menu Kasus & Percakapan.')
-    case_id = body.case_id
-    case = _visible_case(case_id, user) if case_id else _visible_case(_new_case(user, message[:80]), user)
+    _limit(f"chat:{user['session_token']}", RATE_CHAT_PER_MIN)
+    return process_message(user, message, body.case_id)
+
+
+def process_message(user: dict, message: str, case_id: Optional[str], channel: str = '') -> dict:
+    """Satu giliran percakapan untuk semua kanal (web chat, WhatsApp, email)."""
+    case = _visible_case(case_id, user) if case_id else _visible_case(_new_case(user, message[:80], channel), user)
     case_id = case['id']
     if case['status'] in ('Selesai', 'Ditolak'):
         raise HTTPException(409, 'Kasus ini sudah ditutup. Buat percakapan baru untuk melanjutkan.')
 
     with connect() as c:
-        fresh = dict(c.execute('SELECT id,email,name,role,guardrail_strikes,ai_suspended FROM users WHERE id=?', (user['id'],)).fetchone())
+        fresh = dict(c.execute('SELECT id,email,name,role,guardrail_strikes,ai_suspended,is_guest FROM users WHERE id=?', (user['id'],)).fetchone())
         rows = c.execute('SELECT sender,content,meta,created_at FROM messages WHERE case_id=? ORDER BY id', (case_id,)).fetchall()
-    # Pesan yang ditandai manipulasi & pesan sistem tidak dimasukkan ke riwayat LLM.
+    # Pesan yang ditandai manipulasi, pesan sistem, dan data pribadi tidak dimasukkan ke riwayat LLM.
     history = []
     for r in rows:
         m = _loads(r['meta'])
         if r['sender'] == 'system' or m.get('flagged') or m.get('private'):
-            continue  # pesan sistem, manipulasi, dan data rekening tidak pernah dikirim ke LLM
+            continue
         if r['sender'] == 'assistant' and not knowledge.sources_still_valid(m.get('sources') or [], r['created_at'] or ''):
             continue  # jawaban lama dari knowledge yang sudah dihapus/dinonaktifkan/diedit -> dilupakan AI
         history.append({'sender': r['sender'], 'content': r['content']})
@@ -395,6 +470,7 @@ def chat(body: ChatBody, user=Depends(current_user)):
     sensitive = state.get('sensitive') or []
     stored_message = state.get('message') or message
     reply = state.get('reply') or ''
+    private_notes = state.get('private_notes') or []
     kind = state.get('reply_kind') or 'ai'
     hits = {h['id']: h for h in state.get('hits') or []}
     sources = [{'id': i, 'title': hits[i]['title'], 'source_url': hits[i].get('source_url') or '', 'rev': hits[i].get('rev') or 1,
@@ -407,28 +483,59 @@ def chat(body: ChatBody, user=Depends(current_user)):
     intent = state.get('case_intent') or case['intent']
     if case['intent'] == agent.INTENT_LABEL['manipulation']:
         intent = case['intent']
+    code = state.get('intent_code') or case.get('intent_code') or ''
+    conf = float(state.get('confidence') or 0)
+    sentiment, urgency = state.get('sentiment') or case.get('sentiment') or 'netral', state.get('urgency') or 'rendah'
     trace = state.get('trace') or []
+    handoff_reason = state.get('handoff_reason') or ''
+    clarify_count = (int(case.get('clarify_count') or 0) + 1) if state.get('clarify') else (
+        0 if code and taxonomy.band(conf) == 'tinggi' else int(case.get('clarify_count') or 0))
+    ticket_out, handoff_out = None, None
 
     with connect() as c:
         c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
                   (case_id, 'customer', stored_message, json.dumps({'flagged': bool(esc), 'masked': sensitive}, ensure_ascii=False)))
         private = kind == 'account'
-        # Data rekening hanya dikirim di respons ini; riwayat menyimpan penanda saja.
-        stored_reply = ('🔒 Informasi rekening ditampilkan untuk customer yang terverifikasi '
-                        f'(AL{user["auth_level"]}). Datanya tidak disimpan di riwayat percakapan.') if private else reply
+        # Data pribadi (saldo, mutasi, status tiket) hanya dikirim di respons ini; riwayat menyimpan penanda saja.
+        if private:
+            stored_reply = ('🔒 Informasi pribadi ditampilkan untuk nasabah yang terverifikasi '
+                            f'(AL{user["auth_level"]}). Datanya tidak disimpan di riwayat percakapan.')
+        elif private_notes:
+            stored_reply = reply + '\n\n🔒 [Data rekening ditampilkan ke nasabah, tidak disimpan di riwayat.]'
+        else:
+            stored_reply = reply
+        full_reply = reply + ('\n\n' + '\n\n'.join(private_notes) if private_notes else '')
         cur_msg = c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
                   (case_id, 'system' if kind in ('warning', 'system') else 'assistant', stored_reply,
-                   json.dumps({'kind': kind, 'sources': sources, 'private': private, 'auth_level': user['auth_level'],
-                               'auth_required': state.get('auth_required') or 0, 'route': trace, 'intent': state.get('intent'),
-                               'classifier': state.get('classifier'), 'handoff': state.get('handoff_reason', ''),
+                   json.dumps({'kind': kind, 'sources': sources, 'private': private or bool(private_notes), 'auth_level': user['auth_level'],
+                               'auth_required': state.get('auth_required') or 0, 'route': trace, 'intent': code,
+                               'intent_label': taxonomy.label(code) if code else '', 'confidence': conf,
+                               'sentiment': sentiment, 'urgency': urgency, 'agent': state.get('agent') or '',
+                               'classifier': state.get('classifier'), 'handoff': handoff_reason,
+                               'ai_actions': state.get('ai_actions') or [],
                                'retrieved': [{'id': h['id'], 'title': h['title'], 'score': h['score']} for h in hits.values()],
                                'output_problems': state.get('output_problems') or []}, ensure_ascii=False)))
         subject = case['subject'] if case['subject'] not in ('Percakapan baru', '') else stored_message[:120]
         c.execute('''UPDATE cases SET subject=?,intent=?,status=?,priority=?,risk=?,handoff_reason=?,
                      flagged=MAX(flagged,?),ai_locked=MAX(ai_locked,?),verified_level=MAX(verified_level,?),
-                     updated_at=CURRENT_TIMESTAMP WHERE id=?''',
-                  (subject, intent, status, priority, risk, state.get('handoff_reason') or case.get('handoff_reason') or '',
-                   1 if esc else 0, 1 if esc else 0, user['auth_level'], case_id))
+                     intent_code=CASE WHEN ?<>'' THEN ? ELSE intent_code END, intent_confidence=?, sentiment=?, urgency=?,
+                     clarify_count=?, updated_at=CURRENT_TIMESTAMP WHERE id=?''',
+                  (subject, intent, status, priority, risk, handoff_reason or case.get('handoff_reason') or '',
+                   1 if esc else 0, 1 if esc else 0, user['auth_level'], code, code, conf, sentiment, urgency, clarify_count, case_id))
+
+        # --- CRM: tiket otomatis (UC-03) & handoff 17 field (UC-05)
+        cur_case = dict(c.execute('SELECT * FROM cases WHERE id=?', (case_id,)).fetchone())
+        tk_req = state.get('ticket')
+        if tk_req and code:
+            ticket_out = crm.create_or_update_ticket(c, case=cur_case, intent_code=code, confidence=conf, sentiment=sentiment,
+                                                     urgency=urgency, status=tk_req['status'], actor='AI Agent',
+                                                     note=crm.REASON_LABEL.get(handoff_reason, handoff_reason))
+        newly_waiting = status in agent.WAITING and (status != case['status'] or handoff_reason in ('minta_agen', 'keyakinan_rendah', 'klarifikasi_habis'))
+        if newly_waiting:
+            handoff_out = crm.build_handoff(c, case_id=case_id, ticket=ticket_out, reason=handoff_reason or 'perlu_agen',
+                                            auth_level=user['auth_level'], intent_code=code or 'minta_agen', confidence=conf,
+                                            sentiment=sentiment, urgency=urgency if not esc else 'tinggi',
+                                            ai_actions=(state.get('ai_actions') or []) + [f"Rute: {' > '.join(t.split(':')[0] for t in trace)}"])
 
         if esc:
             c.execute('''INSERT INTO guardrail_events(case_id,user_id,stage,score,reasons,message,action)
@@ -451,17 +558,21 @@ def chat(body: ChatBody, user=Depends(current_user)):
                          VALUES(?,?,?,?,?,?,?)''',
                       (case_id, fresh['id'], 'output', len(state['output_problems']), json.dumps(state['output_problems']),
                        (state.get('answer') or '')[:2000], 'Jawaban AI diblok & diteruskan ke agen'))
-        if status != case['status'] and status in ('Menunggu agen', 'Menunggu persetujuan', 'Dialihkan ke admin'):
+        if status != case['status'] and status in agent.WAITING:
             note = {'Menunggu persetujuan': 'Perlu tinjauan agen/supervisor.', 'Dialihkan ke admin': 'Sedang ditinjau admin.'}.get(status, 'Agen customer service akan menindaklanjuti.')
             if not esc:
                 c.execute('INSERT INTO notifications(user_id,case_id,message) VALUES(?,?,?)', (fresh['id'], case_id, f'Tiket {case_id}: {status}. {note}'))
                 if status == 'Menunggu persetujuan' or risk:
                     _notify_admins(c, case_id, f'Tiket {case_id} ({intent}) dari {fresh["name"]}: {status}.')
 
-    audit(user['email'], f"Chat {case_id}; intent={intent}; status={status}; rute={' > '.join(t.split(':')[0] for t in trace)}"
+    audit(user['email'] or 'tamu', f"Chat {case_id}; intent={code or intent}@{conf:.2f}; status={status}; rute={' > '.join(t.split(':')[0] for t in trace)}"
+                         + (f"; tiket={ticket_out['id']}" if ticket_out else '') + (f"; handoff={handoff_out['handoff_id']}" if handoff_out else '')
                          + (f"; GUARDRAIL={','.join(esc['reasons'])}" if esc else ''))
     return {
-        'case_id': case_id, 'reply': reply, 'reply_kind': kind, 'status': status, 'intent': intent, 'risk': bool(risk),
+        'case_id': case_id, 'reply': full_reply, 'reply_kind': kind, 'status': status, 'intent': intent, 'risk': bool(risk),
+        'intent_code': code, 'confidence': conf, 'sentiment': sentiment, 'urgency': urgency, 'agent': state.get('agent') or '',
+        'clarify': bool(state.get('clarify')), 'ticket_id': ticket_out['id'] if ticket_out else None,
+        'handoff_id': handoff_out['handoff_id'] if handoff_out else None,
         'sources': sources, 'warning': bool(esc), 'masked': sensitive, 'message_id': cur_msg.lastrowid,
         'auth_level': user['auth_level'], 'auth_required': state.get('auth_required') or 0,
         'strikes': esc['strikes'] if esc else fresh['guardrail_strikes'],
@@ -506,7 +617,7 @@ async def upload_knowledge(files: list[UploadFile] = File(...), status: str = Fo
 
 
 @app.post('/api/knowledge/preview')
-async def preview_knowledge(file: UploadFile = File(...), user=Depends(admin_only)):
+async def preview_knowledge(file: UploadFile = File(...), user=Depends(supervisor_only)):
     try:
         data = await _read_upload(file)
         text, ftype = knowledge.extract_text(file.filename or 'dokumen.txt', data)
@@ -522,7 +633,7 @@ async def preview_knowledge(file: UploadFile = File(...), user=Depends(admin_onl
 
 
 @app.post('/api/knowledge/import-text')
-def import_text(body: ImportTextBody, user=Depends(admin_only)):
+def import_text(body: ImportTextBody, user=Depends(supervisor_only)):
     try:
         r = knowledge.ingest_document(filename=f"{body.title.strip() or 'Dokumen impor'}.md", text=body.body, title=body.title.strip() or None,
                                       status=body.status, mode='auto', uploaded_by=user['email'])
@@ -533,7 +644,7 @@ def import_text(body: ImportTextBody, user=Depends(admin_only)):
 
 
 @app.get('/api/knowledge/documents')
-def list_documents(user=Depends(admin_only)):
+def list_documents(user=Depends(supervisor_only)):
     with connect() as c:
         rows = c.execute('''SELECT d.id,d.title,d.filename,d.file_type,d.version,d.status,d.chunk_count,d.source_url,d.checked_at,
                                    d.org_name,d.uploaded_by,d.created_at,d.updated_at,
@@ -545,7 +656,7 @@ def list_documents(user=Depends(admin_only)):
 
 
 @app.get('/api/knowledge/documents/{doc_id}')
-def get_document(doc_id: int, user=Depends(admin_only)):
+def get_document(doc_id: int, user=Depends(supervisor_only)):
     with connect() as c:
         d = c.execute('SELECT * FROM knowledge_documents WHERE id=?', (doc_id,)).fetchone()
         if not d:
@@ -557,7 +668,7 @@ def get_document(doc_id: int, user=Depends(admin_only)):
 
 
 @app.get('/api/knowledge/documents/{doc_id}/download', response_class=PlainTextResponse)
-def download_document(doc_id: int, user=Depends(admin_only)):
+def download_document(doc_id: int, user=Depends(supervisor_only)):
     with connect() as c:
         d = c.execute('SELECT filename,raw_text FROM knowledge_documents WHERE id=?', (doc_id,)).fetchone()
     if not d:
@@ -568,7 +679,7 @@ def download_document(doc_id: int, user=Depends(admin_only)):
 
 
 @app.patch('/api/knowledge/documents/{doc_id}')
-def patch_document(doc_id: int, body: DocumentPatch, user=Depends(admin_only)):
+def patch_document(doc_id: int, body: DocumentPatch, user=Depends(supervisor_only)):
     fields, values = [], []
     if body.status is not None:
         if body.status not in ('Aktif', 'Nonaktif'):
@@ -590,7 +701,7 @@ def patch_document(doc_id: int, body: DocumentPatch, user=Depends(admin_only)):
 
 
 @app.post('/api/knowledge/documents/{doc_id}/reindex')
-def reindex_document(doc_id: int, user=Depends(admin_only)):
+def reindex_document(doc_id: int, user=Depends(supervisor_only)):
     """Pecah ulang dokumen dari teks aslinya (perubahan manual per bagian akan tertimpa)."""
     with connect() as c:
         d = c.execute('SELECT * FROM knowledge_documents WHERE id=?', (doc_id,)).fetchone()
@@ -604,7 +715,7 @@ def reindex_document(doc_id: int, user=Depends(admin_only)):
 
 
 @app.delete('/api/knowledge/documents/{doc_id}')
-def delete_document(doc_id: int, user=Depends(admin_only)):
+def delete_document(doc_id: int, user=Depends(supervisor_only)):
     with connect() as c:
         d = c.execute('SELECT filename FROM knowledge_documents WHERE id=?', (doc_id,)).fetchone()
         c.execute('DELETE FROM knowledge WHERE document_id=?', (doc_id,))
@@ -631,7 +742,7 @@ def _validate_article(body: KnowledgeBody):
 
 
 @app.get('/api/knowledge')
-def list_knowledge(q: str = '', document_id: Optional[int] = None, user=Depends(admin_only)):
+def list_knowledge(q: str = '', document_id: Optional[int] = None, user=Depends(supervisor_only)):
     sql = '''SELECT k.*, d.title AS document_title FROM knowledge k LEFT JOIN knowledge_documents d ON d.id=k.document_id
              WHERE (k.title LIKE ? OR k.body LIKE ? OR k.keywords LIKE ?)'''
     args = [f'%{q}%'] * 3
@@ -645,7 +756,7 @@ def list_knowledge(q: str = '', document_id: Optional[int] = None, user=Depends(
 
 
 @app.post('/api/knowledge')
-def create_knowledge(body: KnowledgeBody, user=Depends(admin_only)):
+def create_knowledge(body: KnowledgeBody, user=Depends(supervisor_only)):
     _validate_article(body)
     with connect() as c:
         cur = c.execute('''INSERT INTO knowledge(title,category,keywords,body,status,kind,source_url,validity,checked_at)
@@ -658,7 +769,7 @@ def create_knowledge(body: KnowledgeBody, user=Depends(admin_only)):
 
 
 @app.put('/api/knowledge/{item_id}')
-def update_knowledge(item_id: int, body: KnowledgeBody, user=Depends(admin_only)):
+def update_knowledge(item_id: int, body: KnowledgeBody, user=Depends(supervisor_only)):
     _validate_article(body)
     with connect() as c:
         cur = c.execute('''UPDATE knowledge SET title=?,category=?,keywords=?,body=?,status=?,kind=?,source_url=?,validity=?,
@@ -673,7 +784,7 @@ def update_knowledge(item_id: int, body: KnowledgeBody, user=Depends(admin_only)
 
 
 @app.delete('/api/knowledge/{item_id}')
-def delete_knowledge(item_id: int, user=Depends(admin_only)):
+def delete_knowledge(item_id: int, user=Depends(supervisor_only)):
     with connect() as c:
         row = c.execute('SELECT document_id FROM knowledge WHERE id=?', (item_id,)).fetchone()
         cur = c.execute('DELETE FROM knowledge WHERE id=?', (item_id,))
@@ -688,7 +799,7 @@ def delete_knowledge(item_id: int, user=Depends(admin_only)):
 
 
 @app.post('/api/knowledge/search-test')
-def search_test(body: SearchTestBody, user=Depends(admin_only)):
+def search_test(body: SearchTestBody, user=Depends(supervisor_only)):
     """Uji: bagian knowledge mana yang akan dipakai AI untuk pertanyaan ini."""
     hits = knowledge.search(body.query, debug=True)
     intent = agent.rule_intent(body.query)
@@ -730,8 +841,15 @@ def dashboard(user=Depends(admin_only)):
     kb = knowledge.kb_stats()
     return {'total_cases': total, 'statuses': statuses, 'active_knowledge_articles': kb['active_chunks'], 'knowledge_documents': kb['documents'],
             'guardrail_pending': guard_pending, 'suspended_users': suspended, 'unread_notifications': unread,
-            'recent_audit': audits, 'model': GEMINI_MODEL, 'gemini_configured': llm.is_configured(),
-            'llm_classifier': LLM_CLASSIFIER, 'router': 'LangGraph', 'org': knowledge.current_org(), 'max_strikes': GUARDRAIL_MAX_STRIKES}
+            'recent_audit': audits, 'model': llm.active_model(), 'llm_provider': llm.provider_chain(), 'gemini_configured': llm.is_configured(),
+            'llm_classifier': LLM_CLASSIFIER, 'router': 'LangGraph', 'org': knowledge.current_org(), 'max_strikes': GUARDRAIL_MAX_STRIKES,
+            'staff_role': user.get('staff_role') or 'supervisor', 'crm': _crm_summary()}
+
+
+def _crm_summary():
+    with connect() as c:
+        a = crm.analytics(c)
+    return {k: a[k] for k in ('tickets_open', 'sla_compliance_pct', 'sla_breached_open', 'sla_at_risk_open', 'ai_auto_resolved_pct')}
 
 
 @app.get('/api/admin/graph')
@@ -740,7 +858,7 @@ def graph(user=Depends(admin_only)):
 
 
 @app.get('/api/admin/approvals')
-def approvals(user=Depends(admin_only)):
+def approvals(user=Depends(supervisor_only)):
     with connect() as c:
         rows = c.execute('''SELECT cases.*,users.name customer_name,users.email customer_email,
           (SELECT content FROM messages WHERE messages.case_id=cases.id AND sender='customer' ORDER BY id DESC LIMIT 1) last_message
@@ -749,7 +867,7 @@ def approvals(user=Depends(admin_only)):
 
 
 @app.post('/api/admin/approvals/{case_id}')
-def decide(case_id: str, body: DecisionBody, user=Depends(admin_only)):
+def decide(case_id: str, body: DecisionBody, user=Depends(supervisor_only)):
     case = _visible_case(case_id, user)
     if case['status'] != 'Menunggu persetujuan':
         raise HTTPException(409, 'Kasus tidak sedang menunggu persetujuan.')
@@ -762,13 +880,20 @@ def decide(case_id: str, body: DecisionBody, user=Depends(admin_only)):
     with connect() as c:
         c.execute('UPDATE cases SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', (status, case_id))
         c.execute('INSERT INTO messages(case_id,sender,content) VALUES(?,?,?)', (case_id, 'agent', answer))
+        tk = crm.open_ticket_for_case(c, case_id)
+        if tk and body.approve:
+            crm.close_ticket(c, tk['id'], actor=user['email'], root_cause='Permintaan nasabah (bukan masalah)',
+                             checklist={'identitas': True, 'bukti': True, 'solusi': True, 'akar_masalah': True, 'dokumentasi': True},
+                             note=f'Disetujui supervisor {user["email"]} (nasabah AL{case.get("verified_level")}).')
+        elif tk:
+            crm.transition(c, tk['id'], 'Ditolak', user['email'], 'Permintaan ditolak supervisor')
         c.execute('INSERT INTO notifications(user_id,case_id,message) VALUES(?,?,?)', (case['user_id'], case_id, f'Tiket {case_id}: {status}. {answer}'))
     audit(user['email'], f'{"Menyetujui" if body.approve else "Menolak"} {case_id} (customer AL{case.get("verified_level") or 1})')
     return {'ok': True, 'case_id': case_id, 'status': status}
 
 
 @app.get('/api/admin/audit')
-def audit_log(user=Depends(admin_only)):
+def audit_log(user=Depends(supervisor_only)):
     with connect() as c:
         rows = c.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 200').fetchall()
     return {'items': [dict(r) for r in rows]}
@@ -780,18 +905,33 @@ def agent_reply(case_id: str, body: AgentReplyBody, user=Depends(admin_only)):
     if case['status'] in ('Selesai', 'Ditolak'):
         raise HTTPException(409, 'Kasus sudah ditutup.')
     message = body.message.strip()
+    ticket = None
     with connect() as c:
-        c.execute('INSERT INTO messages(case_id,sender,content) VALUES(?,?,?)', (case_id, 'agent', message))
-        c.execute("UPDATE cases SET status='Ditangani',updated_at=CURRENT_TIMESTAMP WHERE id=?", (case_id,))
+        c.execute('INSERT INTO messages(case_id,sender,content,meta) VALUES(?,?,?,?)',
+                  (case_id, 'agent', message, json.dumps({'kind': 'agent', 'by': user['name'], 'copilot_used': body.copilot_used})))
+        c.execute("UPDATE cases SET status=CASE WHEN status='Menunggu persetujuan' THEN status ELSE 'Ditangani' END,updated_at=CURRENT_TIMESTAMP WHERE id=?", (case_id,))
+        c.execute("UPDATE handoffs SET accepted_by=?, accepted_at=? WHERE case_id=? AND accepted_by IS NULL",
+                  (user['email'], identity.ts(identity.now()), case_id))
+        tk = crm.open_ticket_for_case(c, case_id)
+        if tk:
+            t = dict(tk)
+            for target in (['Ditangani Agen', 'Menunggu Nasabah'] if body.awaiting_customer else ['Ditangani Agen']):
+                if t['status'] != target and target in crm.TRANSITIONS.get(t['status'], ()):
+                    t = crm.transition(c, t['id'], target, user['email'], 'Agen membalas' + (' (draf Copilot)' if body.copilot_used else ''))
+            c.execute("UPDATE tickets SET assigned_to=CASE WHEN assigned_to='' THEN ? ELSE assigned_to END WHERE id=?", (user['email'], t['id']))
+            ticket = crm.ticket_dict(c.execute('SELECT * FROM tickets WHERE id=?', (t['id'],)).fetchone())
         c.execute('INSERT INTO notifications(user_id,case_id,message) VALUES(?,?,?)', (case['user_id'], case_id, f'Agen CS membalas tiket {case_id}.'))
-    audit(user['email'], f'Agen membalas {case_id}')
-    return {'ok': True, 'case_id': case_id, 'status': 'Ditangani'}
+    audit(user['email'], f'Agen membalas {case_id}' + (' (memakai draf Copilot)' if body.copilot_used else ''))
+    return {'ok': True, 'case_id': case_id, 'status': 'Ditangani', 'ticket': ticket}
 
 
 @app.post('/api/admin/cases/{case_id}/resolve')
 def resolve_case(case_id: str, user=Depends(admin_only)):
     case = _visible_case(case_id, user)
     with connect() as c:
+        open_t = [r['id'] for r in c.execute("SELECT id FROM tickets WHERE case_id=? AND status NOT IN ('Selesai','Ditolak')", (case_id,))]
+        if open_t:
+            raise HTTPException(409, f"Tutup dulu tiket {', '.join(open_t)} dengan closure checklist sebelum menandai kasus selesai.")
         c.execute("UPDATE cases SET status='Selesai',updated_at=CURRENT_TIMESTAMP WHERE id=?", (case_id,))
         c.execute('INSERT INTO messages(case_id,sender,content) VALUES(?,?,?)', (case_id, 'agent', 'Kasus ini telah ditandai selesai oleh agen customer service.'))
         c.execute('INSERT INTO notifications(user_id,case_id,message) VALUES(?,?,?)', (case['user_id'], case_id, f'Tiket {case_id} telah diselesaikan.'))
@@ -812,7 +952,7 @@ def unlock_case_ai(case_id: str, user=Depends(admin_only)):
 
 # --- Guardrail -----------------------------------------------------------------
 @app.get('/api/admin/guardrail')
-def guardrail_events(only_pending: bool = False, user=Depends(admin_only)):
+def guardrail_events(only_pending: bool = False, user=Depends(supervisor_only)):
     sql = '''SELECT g.*, u.name customer_name, u.email customer_email, u.guardrail_strikes, u.ai_suspended,
                     c.status case_status, c.ai_locked
              FROM guardrail_events g LEFT JOIN users u ON u.id=g.user_id LEFT JOIN cases c ON c.id=g.case_id'''
@@ -830,7 +970,7 @@ def guardrail_events(only_pending: bool = False, user=Depends(admin_only)):
 
 
 @app.post('/api/admin/guardrail/{event_id}/review')
-def review_event(event_id: int, body: ReviewBody, user=Depends(admin_only)):
+def review_event(event_id: int, body: ReviewBody, user=Depends(supervisor_only)):
     if body.verdict not in ('confirmed', 'false_positive'):
         raise HTTPException(400, 'Verdict harus confirmed atau false_positive.')
     with connect() as c:
@@ -851,7 +991,7 @@ def review_event(event_id: int, body: ReviewBody, user=Depends(admin_only)):
 
 
 @app.post('/api/admin/users/{user_id}/restore-ai')
-def restore_ai(user_id: int, user=Depends(admin_only)):
+def restore_ai(user_id: int, user=Depends(supervisor_only)):
     with connect() as c:
         cur = c.execute("UPDATE users SET guardrail_strikes=0, ai_suspended=0 WHERE id=? AND role='customer'", (user_id,))
         if not cur.rowcount:
@@ -859,3 +999,9 @@ def restore_ai(user_id: int, user=Depends(admin_only)):
         c.execute('INSERT INTO notifications(user_id,message) VALUES(?,?)', (user_id, 'Akses asisten AI pada akun Anda telah dipulihkan oleh admin.'))
     audit(user['email'], f'Memulihkan akses AI customer #{user_id}')
     return {'ok': True}
+
+
+# Endpoint operasional (tiket, handoff, Copilot, bukti, email, analitik, QA)
+from .routes_ops import router as _ops_router  # noqa: E402
+
+app.include_router(_ops_router)
