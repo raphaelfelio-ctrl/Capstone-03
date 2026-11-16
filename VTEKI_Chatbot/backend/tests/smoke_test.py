@@ -14,6 +14,8 @@ tmp = tempfile.mkdtemp()
 os.environ["DATABASE_PATH"] = str(Path(tmp) / "test.db")
 os.environ["GEMINI_API_KEY"] = "dummy-key-untuk-uji"
 os.environ["LLM_CLASSIFIER"] = "true"
+os.environ["RATE_CHAT_PER_MIN"] = "1000"
+os.environ["STORAGE_DIR"] = str(Path(tmp) / "storage")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -24,7 +26,7 @@ def fake_generate_json(system, prompt, **kw):
     msg = re.search(r"<pesan_customer>\n(.*?)\n</pesan_customer>", prompt, re.S).group(1)
     if system.startswith("Anda adalah pengklasifikasi"):
         subtle = "nenek" in msg.lower()
-        intent = "out_of_scope" if "resep" in msg.lower() else agent.rule_intent(msg)
+        intent = "di_luar_topik" if "resep" in msg.lower() else agent.rule_intent(msg)
         return {"intent": intent, "search_query": msg, "manipulation": subtle,
                 "manipulation_confidence": 0.9 if subtle else 0.0, "manipulation_reason": "roleplay" if subtle else ""}
     arts = re.findall(r'<artikel id="(\d+)" judul="([^"]*)"[^>]*>\n(.*?)\n</artikel>', prompt, re.S)
@@ -103,13 +105,13 @@ with TestClient(app) as client:
     check("di luar topik ditolak sopan", r["intent"] == "Di luar topik" and r["status"] == "Selesai otomatis", str(r))
     r = client.post("/api/chat", headers=C, json={"message": "berapa harga tiket pesawat ke bali"}).json()
     check("tidak ada knowledge -> ke agen, tidak menebak", r["status"] == "Menunggu agen" and not r["sources"], str(r))
-    r = client.post("/api/chat", headers=C, json={"message": "tolong blokir kartu saya"}).json()
+    r = client.post("/api/chat", headers=C, json={"message": "tolong naikkan limit kartu kredit saya"}).json()
     check("permintaan tindakan -> Menunggu persetujuan", r["status"] == "Menunggu persetujuan", str(r))
     case_appr = r["case_id"]
     r = client.post("/api/chat", headers=C, json={"message": "apa itu klikbca", "case_id": case_appr}).json()
     check("status menunggu tidak turun", r["status"] == "Menunggu persetujuan", str(r))
     r = client.post("/api/chat", headers=C, json={"message": "ada transaksi yang tidak saya kenal di rekening saya"}).json()
-    check("laporan penipuan -> prioritas tinggi", r["intent"] == "Laporan Penipuan" and r["risk"], str(r))
+    check("laporan penipuan -> prioritas tinggi", r["intent"] == "Indikasi Penipuan/Fraud" and r["risk"], str(r))
     r = client.post("/api/chat", headers=C, json={"message": "halusinasi: nomor bantuan bca apa"}).json()
     check("output guard memblok nomor/URL karangan", "021-9999" not in r["reply"] and r["status"] == "Menunggu agen", r["reply"])
     r = client.post("/api/chat", headers=C, json={"message": "otp saya 123456 apakah aman diberikan ke cs?"}).json()

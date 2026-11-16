@@ -18,6 +18,8 @@ tmp = tempfile.mkdtemp()
 os.environ["DATABASE_PATH"] = str(Path(tmp) / "switch.db")
 os.environ["GEMINI_API_KEY"] = "dummy-key-untuk-uji"
 os.environ["LLM_CLASSIFIER"] = "true"
+os.environ["RATE_CHAT_PER_MIN"] = "1000"
+os.environ["STORAGE_DIR"] = str(Path(tmp) / "storage")
 
 from fastapi.testclient import TestClient  # noqa: E402
 

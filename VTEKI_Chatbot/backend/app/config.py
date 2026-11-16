@@ -33,6 +33,16 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 # Model cadangan (dipisah koma) bila model utama kena batas kuota / tidak tersedia.
 _fallbacks = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite").split(",") if m.strip()]
 GEMINI_MODELS = [GEMINI_MODEL] + [m for m in _fallbacks if m != GEMINI_MODEL]
+# --- Penyedia LLM (adapter, lihat llm.py) ---------------------------------
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower() or "gemini"
+LLM_FALLBACK_PROVIDERS = [p.strip().lower() for p in os.getenv("LLM_FALLBACK_PROVIDERS", "").split(",") if p.strip()]
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()          # wajib diisi bila memakai openai
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+OLLAMA_URL = os.getenv("OLLAMA_URL", "").strip()              # mis. http://localhost:11434
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3").strip()
 # Klasifikasi intent + deteksi manipulasi dengan LLM (1 panggilan tambahan per pesan).
 # Matikan (false) bila kuota gratis sering habis; aturan berbasis pola tetap berjalan.
 LLM_CLASSIFIER = _bool("LLM_CLASSIFIER", True)
@@ -81,3 +91,33 @@ PIN_MAX_ATTEMPTS = _int("PIN_MAX_ATTEMPTS", 3)  # salah sekian kali -> PIN dikun
 PIN_LOCK_MIN = _int("PIN_LOCK_MIN", 15)
 # Prototipe tanpa SMS gateway: kode OTP ditampilkan di layar. WAJIB false di produksi.
 OTP_DEMO_MODE = _bool("OTP_DEMO_MODE", True)
+
+# --- Router: ambang keyakinan intent (spesifikasi §3.2) ----------------------
+CONFIDENCE_HIGH = _float("CONFIDENCE_HIGH", 0.75)        # >= : langsung diproses + tiket
+CONFIDENCE_CLARIFY = _float("CONFIDENCE_CLARIFY", 0.45)  # 0.45-0.74 : klarifikasi; < : handoff
+MAX_CLARIFY_TURNS = _int("MAX_CLARIFY_TURNS", 2)
+
+# --- AL0 / OTP (spesifikasi §3.1) --------------------------------------------
+OTP_FAIL_LOCK_STREAK = _int("OTP_FAIL_LOCK_STREAK", 3)   # gagal OTP berturut-turut -> sesi dikunci + handoff
+OTP_SESSION_LOCK_MIN = _int("OTP_SESSION_LOCK_MIN", 15)
+
+# --- SLA berbasis kalender kerja (Asia/Jakarta, UTC+7, tanpa DST) -------------
+SLA_WORK_START = _int("SLA_WORK_START", 8)     # jam mulai kerja (WIB)
+SLA_WORK_END = _int("SLA_WORK_END", 17)        # jam selesai kerja (WIB)
+SLA_WORKDAYS = [int(x) for x in os.getenv("SLA_WORKDAYS", "0,1,2,3,4").split(",") if x.strip().isdigit()]  # 0=Senin
+SLA_HOLIDAYS = [x.strip() for x in os.getenv("SLA_HOLIDAYS", "2026-12-25,2027-01-01").split(",") if x.strip()]
+# Target penyelesaian dalam MENIT JAM KERJA per prioritas
+SLA_TARGET_MIN = {"Kritis": _int("SLA_KRITIS_MIN", 120), "Tinggi": _int("SLA_TINGGI_MIN", 240),
+                  "Normal": _int("SLA_NORMAL_MIN", 960), "Rendah": _int("SLA_RENDAH_MIN", 1440)}
+SLA_FIRST_RESPONSE_MIN = _int("SLA_FIRST_RESPONSE_MIN", 30)
+
+# --- Bukti / evidence (spesifikasi §3.3) ---------------------------------------
+STORAGE_DIR = (BACKEND_DIR / os.getenv("STORAGE_DIR", "./storage")).resolve() if not Path(os.getenv("STORAGE_DIR", "./storage")).is_absolute() else Path(os.getenv("STORAGE_DIR"))
+EVIDENCE_MAX_MB = _int("EVIDENCE_MAX_MB", 5)
+CLAMAV_HOST = os.getenv("CLAMAV_HOST", "").strip()       # bila diisi: pemindaian lewat daemon ClamAV (clamd)
+CLAMAV_PORT = _int("CLAMAV_PORT", 3310)
+
+# --- Rate limit (per sesi / IP, jendela 60 detik) -------------------------------
+RATE_CHAT_PER_MIN = _int("RATE_CHAT_PER_MIN", 20)
+RATE_GUEST_PER_MIN = _int("RATE_GUEST_PER_MIN", 10)
+RATE_UPLOAD_PER_MIN = _int("RATE_UPLOAD_PER_MIN", 5)

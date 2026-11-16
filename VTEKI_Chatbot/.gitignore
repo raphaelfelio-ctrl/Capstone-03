@@ -7,3 +7,4 @@ backend/vteki.db
 backend/tests/__pycache__/
 backend/.env.example
 *.bat
+backend/storage/
