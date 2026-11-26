@@ -1,14 +1,11 @@
 import json
 import logging
-import re
-
 from typing import Optional
+
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
-
-from .security import hash_password
 
 from . import agent, knowledge, llm
 from .config import (ASSISTANT_NAME, GEMINI_MODEL, GUARDRAIL_MAX_STRIKES, KNOWLEDGE_AUTO_SYNC, KNOWLEDGE_DIR,
@@ -40,12 +37,6 @@ def startup():
 # ---------------------------------------------------------------------------
 # Model request
 # ---------------------------------------------------------------------------
-
-class RegisterBody(BaseModel):
-    name: str = Field(min_length=2, max_length=80)
-    email: str = Field(max_length=120)
-    password: str = Field(min_length=8, max_length=128)
-
 class LoginBody(BaseModel):
     email: str
     password: str
@@ -232,24 +223,6 @@ def messages(case_id: str, user=Depends(current_user)):
 # ---------------------------------------------------------------------------
 # Chat (LangGraph)
 # ---------------------------------------------------------------------------
-
-@app.post('/api/auth/register')
-def register(body: RegisterBody):
-    email = body.email.strip().lower()
-    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email):
-        raise HTTPException(400, 'Format email tidak valid.')
-    if not (re.search(r'[A-Za-z]', body.password) and re.search(r'\d', body.password)):
-        raise HTTPException(400, 'Kata sandi harus mengandung huruf dan angka.')
-    with connect() as c:
-        if c.execute('SELECT 1 FROM users WHERE email=?', (email,)).fetchone():
-            raise HTTPException(409, 'Email sudah terdaftar.')
-        # role dipaksa 'customer': jangan pernah menerima role dari input pengguna
-        c.execute('INSERT INTO users(email,name,role,password_hash) VALUES(?,?,?,?)',
-                  (email, body.name.strip(), 'customer', hash_password(body.password)))
-    audit(email, 'Registrasi akun baru')
-    return login(LoginBody(email=email, password=body.password)) 
-
-
 @app.post('/api/chat')
 def chat(body: ChatBody, user=Depends(current_user)):
     message = body.message.strip()
@@ -265,10 +238,17 @@ def chat(body: ChatBody, user=Depends(current_user)):
 
     with connect() as c:
         fresh = dict(c.execute('SELECT id,email,name,role,guardrail_strikes,ai_suspended FROM users WHERE id=?', (user['id'],)).fetchone())
-        rows = c.execute('SELECT sender,content,meta FROM messages WHERE case_id=? ORDER BY id', (case_id,)).fetchall()
+        rows = c.execute('SELECT sender,content,meta,created_at FROM messages WHERE case_id=? ORDER BY id', (case_id,)).fetchall()
     # Pesan yang ditandai manipulasi & pesan sistem tidak dimasukkan ke riwayat LLM.
-    history = [{'sender': r['sender'], 'content': r['content']} for r in rows
-               if r['sender'] != 'system' and not _loads(r['meta']).get('flagged')]
+    history = []
+    for r in rows:
+        m = _loads(r['meta'])
+        if r['sender'] == 'system' or m.get('flagged'):
+            continue
+        src_ids = [s_['id'] for s_ in (m.get('sources') or [])]
+        if r['sender'] == 'assistant' and src_ids and not set(src_ids) <= knowledge.active_fact_ids(src_ids, r['created_at'] or ''):
+            continue  # jawaban lama dari knowledge yang sudah dihapus/diganti -> dilupakan AI
+        history.append({'sender': r['sender'], 'content': r['content']})
 
     state = agent.run_chat(user=fresh, case=case, message=message, history=history)
 
@@ -480,10 +460,13 @@ def reindex_document(doc_id: int, user=Depends(admin_only)):
 @app.delete('/api/knowledge/documents/{doc_id}')
 def delete_document(doc_id: int, user=Depends(admin_only)):
     with connect() as c:
+        d = c.execute('SELECT filename FROM knowledge_documents WHERE id=?', (doc_id,)).fetchone()
         c.execute('DELETE FROM knowledge WHERE document_id=?', (doc_id,))
         cur = c.execute('DELETE FROM knowledge_documents WHERE id=?', (doc_id,))
         if not cur.rowcount:
             raise HTTPException(404, 'Dokumen tidak ditemukan.')
+    if d:
+        knowledge.mark_deleted(d['filename'])
     knowledge.invalidate_index()
     audit(user['email'], f'Menghapus dokumen KD-{doc_id} beserta seluruh bagiannya')
     return {'ok': True}

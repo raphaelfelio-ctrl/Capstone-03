@@ -432,9 +432,36 @@ def ingest_document(*, filename: str, data: bytes | None = None, text: str | Non
                       (ch["title"], category if (category and ch["kind"] == "fakta") else ch["category"], ch["keywords"],
                        ch["body"], ch["status"], doc_id, ch["section"], ch["kind"], ch["source_url"],
                        ch["validity"], ch["checked_at"], pos))
+    if not uploaded_by.startswith("sync:"):
+        with connect() as c:
+            c.execute("DELETE FROM app_meta WHERE key=?", (_tombstone_key(filename),))
     invalidate_index()
     return {"filename": filename, "document_id": doc_id, "title": doc_title, "version": version,
             "chunks": len(parsed["chunks"]), "action": action}
+
+
+def _tombstone_key(filename: str) -> str:
+    return "kb_deleted:" + filename
+
+
+def mark_deleted(filename: str) -> None:
+    """Catat bahwa dokumen ini dihapus admin agar sinkron folder tidak mengimpornya lagi."""
+    with connect() as c:
+        c.execute("INSERT INTO app_meta(key,value) VALUES(?,'1') ON CONFLICT(key) DO UPDATE SET value='1'", (_tombstone_key(filename),))
+
+
+def active_fact_ids(ids, since: str = "") -> set:
+    """Subset id bagian yang SAAT INI masih aktif dipakai AI (belum dihapus/dinonaktifkan).
+    Bila `since` diisi, bagian yang diedit setelah waktu itu dianggap berubah (tidak lagi valid)."""
+    ids = [int(i) for i in ids if str(i).lstrip("-").isdigit()]
+    if not ids:
+        return set()
+    with connect() as c:
+        rows = c.execute(f"""SELECT k.id FROM knowledge k LEFT JOIN knowledge_documents d ON d.id=k.document_id
+                             WHERE k.id IN ({','.join('?' * len(ids))}) AND k.status='Aktif' AND k.kind='fakta'
+                             AND (d.id IS NULL OR d.status='Aktif')
+                             AND (?='' OR k.updated_at<=?)""", [*ids, since, since]).fetchall()
+    return {r["id"] for r in rows}
 
 
 def sync_knowledge_dir(folder: Path) -> list[dict]:
@@ -444,6 +471,13 @@ def sync_knowledge_dir(folder: Path) -> list[dict]:
         return results
     for path in sorted(folder.iterdir()):
         if not path.is_file() or path.suffix.lower() not in ALLOWED_EXT or path.name.startswith(("~", ".")):
+            continue
+        with connect() as c:
+            deleted = c.execute("SELECT 1 FROM app_meta WHERE key=?", (_tombstone_key(path.name),)).fetchone()
+            current = c.execute("SELECT uploaded_by FROM knowledge_documents WHERE filename=? ORDER BY id DESC LIMIT 1", (path.name,)).fetchone()
+        if deleted or (current and not (current["uploaded_by"] or "").startswith("sync:")):
+            # Sudah dihapus admin, atau versinya sudah diganti lewat menu -> jangan ditimpa/dihidupkan lagi.
+            results.append({"filename": path.name, "action": "skipped"})
             continue
         try:
             results.append(ingest_document(filename=path.name, data=path.read_bytes(), mode="auto", uploaded_by="sync:knowledge/"))
