@@ -1,140 +1,176 @@
-# V-TEKI Workspace — Gemini Backend
+# V-TEKI Workspace — Chatbot Layanan Pelanggan (Gemini + LangGraph)
 
-Prototype backend untuk front end V-TEKI Workspace. Stack: **FastAPI + SQLite + Gemini API**. Backend menyimpan akun, sesi login, tiket, riwayat chat, artikel Basis Pengetahuan, notifikasi, dan audit trail.
+Prototipe customer service AI. Stack: **FastAPI + SQLite + Gemini API + LangGraph**. Knowledge base saat ini memakai dokumen `knowledge/BCA_Knowledge_Base_Customer_Service.md`.
 
-> **Penting:** akun dan artikel yang disertakan adalah data demo Bank Nusantara. Aplikasi ini tidak terhubung ke sistem bank sungguhan. Fitur persetujuan hanya mengubah status demo; tidak memblokir kartu atau memindahkan uang.
+> **Penting:** ini prototipe independen, **bukan kanal resmi BCA**, dan tidak terhubung ke sistem bank. Persetujuan admin hanya mengubah status demo; tidak ada kartu yang diblokir atau uang yang dipindahkan.
 
-## 1. Kebutuhan
+## Yang baru di versi 2
 
-- Windows 10/11
-- Python 3.11 atau lebih baru
-- Koneksi internet untuk memanggil Gemini API
-- Gemini API key dari [Google AI Studio](https://aistudio.google.com/apikey)
+| Fitur | Ringkasnya |
+|---|---|
+| **Knowledge dari file** | Unggah `.md`, `.txt`, `.pdf`, `.docx` (bisa banyak sekaligus, drag & drop). Dokumen dipecah otomatis per judul `##`/`###` menjadi bagian kecil lengkap dengan kategori, kata kunci, URL sumber, dan validitas. |
+| **Versi dokumen** | Unggah file dengan nama sama = versi baru (bagian lama diganti). File identik dilewati. Ada pratinjau, unduh, indeks ulang, aktif/nonaktif per dokumen atau per bagian. |
+| **Folder `knowledge/`** | File di folder ini otomatis diimpor saat backend start (bila baru/berubah). |
+| **Jawaban tidak sembarangan** | Pencarian BM25 + stemmer bahasa Indonesia + ambang skor. Gemini wajib mengembalikan `grounded` + `source_ids`; jika tidak ada sumber → AI bilang belum tahu dan tiket diteruskan ke agen. Sumber jawaban tampil di chat. |
+| **Guardrail anti-manipulasi** | Deteksi prompt injection, jailbreak, roleplay, klaim admin, tag sistem palsu, teks tersamar (spasi/leetspeak/zero-width) + klasifikasi Gemini. Jika terdeteksi: AI berhenti, customer diberi **peringatan**, percakapan **langsung dialihkan ke admin** & dikunci, admin dinotifikasi. Setelah 3 peringatan, AI dinonaktifkan untuk customer tsb. |
+| **Output guard** | Jawaban AI diblok bila menyebut nomor/URL yang tidak ada di knowledge, meminta OTP/PIN, mengaku sudah memblokir/refund, atau membocorkan instruksi. |
+| **Masking data rahasia** | OTP, PIN, password, CVV, dan nomor kartu (cek Luhn) disamarkan sebelum disimpan atau dikirim ke Gemini. |
+| **Routing LangGraph** | Lihat diagram di bawah. Rute tiap pesan terlihat oleh admin di halaman Kasus. |
 
-## 2. Instalasi di Windows
+## 1. Instalasi (Windows)
 
-Buka terminal VS Code di folder `vteki_gemini`.
+Paling mudah: klik dua kali **`setup.bat`**, isi `GEMINI_API_KEY` di `backend\.env`, lalu klik **`start_all.bat`**.
+
+Manual:
 
 ```powershell
 cd backend
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 pip install -r requirements.txt
-Copy-Item .env.example .env
+Copy-Item .env.example .env     # lewati jika .env sudah ada
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
-Buka `backend/.env`, lalu isi `GEMINI_API_KEY`. Model default `gemini-2.5-flash` disimpan pada `GEMINI_MODEL`; jika model tersebut tidak tersedia untuk project/API key Anda, ganti dengan model Flash yang tercantum di dokumentasi Gemini API dan tersedia untuk akun Anda. Jangan taruh API key di `frontend/index.html` atau commit file `.env` ke Git.
+Terminal kedua: `cd frontend` lalu `py -m http.server 5500`, buka http://127.0.0.1:5500.
 
-Jalankan backend dari folder `backend`:
+> **Upgrade dari versi lama:** cukup jalankan ulang `pip install -r requirements.txt` (ada paket baru: `langgraph`, `python-multipart`, `pypdf`, `python-docx`, `PySastrawi`). Database lama dimigrasi otomatis: kasus, pesan, dan audit tetap utuh; artikel lama (demo Bank Nusantara dan impor teks satu-blok) dijadikan **Draf** dengan kategori "Arsip lama" — tidak dihapus.
 
-```powershell
-uvicorn app.main:app --reload
-```
-
-Backend tersedia di `http://127.0.0.1:8000`. Dokumentasi endpoint interaktif: `http://127.0.0.1:8000/docs`.
-
-Buka terminal VS Code kedua, dari folder proyek jalankan frontend:
-
-```powershell
-cd frontend
-py -m http.server 5500
-```
-
-Buka `http://127.0.0.1:5500`. Jangan buka HTML langsung dengan `file://` karena browser dapat membatasi request API.
-
-## 3. Akun demo
+## 2. Akun demo
 
 | Peran | Email | Kata sandi |
 |---|---|---|
 | Admin | `admin@vteki.id` | `admin123` |
 | Customer | `customer@vteki.id` | `cust1234` |
 
-Ganti atau hapus akun demo sebelum deployment. Database SQLite dibuat otomatis sebagai `backend/vteki.db` ketika server pertama kali dijalankan.
+## 3. Mengelola knowledge
 
-## 4. Workflow sistem
+1. Login Admin → **Basis Pengetahuan**.
+2. Seret file ke kotak unggah (atau klik *Pilih file*). Klik **Pratinjau pemecahan** untuk melihat hasil pecahannya sebelum disimpan, lalu **Unggah**.
+3. Klik dokumen untuk melihat bagian-bagiannya; tiap bagian bisa diedit (judul, kategori, jenis, status, validitas, URL sumber, kata kunci, isi).
+4. Gunakan **Uji pencarian** untuk memastikan pertanyaan customer menemukan bagian yang benar sebelum dipakai.
 
-1. **Login & otorisasi** — frontend mengirim email/kata sandi ke `POST /api/auth/login`. Backend memverifikasi hash kata sandi dan mengembalikan bearer token. Setiap endpoint privat memeriksa token dan role.
-2. **Customer membuat pesan** — frontend mengirim `message` dan opsional `case_id` ke `POST /api/chat`. Backend membuat tiket jika belum ada, lalu menyimpan pesan customer.
-3. **Pencarian Basis Pengetahuan (RAG sederhana)** — backend mencocokkan kata dalam pertanyaan dengan judul, kata kunci, dan isi artikel berstatus `Aktif`. Artikel yang cocok dimasukkan sebagai konteks prompt.
-4. **Gemini menghasilkan jawaban** — backend memanggil Gemini melalui SDK `google-genai`. Instruksi sistem membatasi jawaban pada fakta KB dan melarang klaim bahwa tindakan akun sudah dijalankan.
-5. **Klasifikasi dan guardrail** — backend menandai komplain sebagai `Menunggu agen`, serta permintaan refund/blokir/perubahan data sebagai `Menunggu persetujuan`. Ini adalah aturan sederhana berbasis kata kunci, bukan klasifikasi ML yang terlatih.
-6. **Simpan hasil** — balasan, status tiket, dan notifikasi disimpan ke SQLite. Jika tidak ada artikel yang cocok, jawaban menyatakan keterbatasan dan tiket diarahkan ke agen.
-7. **Admin menangani kasus** — admin dapat melihat semua tiket, membalas sebagai agen, memeriksa permintaan berisiko, dan menyetujui/menolak permintaan demo.
-8. **Admin mengelola KB & audit** — admin dapat menambah, mengubah, mengaktifkan, menjadikan draf, menghapus, atau mengimpor teks sebagai artikel. Aktivitas penting dicatat di audit trail.
+**Agar dokumen baru terbaca baik**, ikuti pola file BCA:
 
-### Diagram alur
+```markdown
+# Judul dokumen
+**Tanggal penyusunan:** 28 Oktober 2026        ← dibaca sebagai tanggal pemeriksaan
+**Sumber utama:** https://...                   ← URL sumber default
+
+## 0. Instruksi untuk AI Agent                  ← otomatis jenis "instruksi" (panduan perilaku AI)
+## 2. Kanal bantuan resmi
+### Halo BCA                                    ← tiap ### jadi satu bagian
+## 7. FAQ
+### Q1. Bagaimana cara menghubungi Halo BCA?    ← satu pertanyaan = satu bagian
+## 9. Metadata yang disarankan untuk database   ← otomatis jenis "metadata" (tidak dipakai)
+```
+
+Jenis bagian:
+- **fakta** — dicari & dipakai untuk menjawab.
+- **instruksi** — judul seperti "Instruksi untuk AI", "Jika jawaban tidak ditemukan"; ditambahkan ke prompt sebagai panduan (tidak bisa mengalahkan aturan inti).
+- **metadata** — disimpan, tidak pernah dipakai.
+
+Bagian bertanda *dinamis* (biaya, limit, nomor, ketentuan) membuat AI mengingatkan customer untuk memverifikasi di sumber resmi.
+
+## 4. Routing LangGraph
 
 ```mermaid
 flowchart TD
-    A[Customer login] --> B[Kirim pertanyaan]
-    B --> C[FastAPI validasi sesi & tiket]
-    C --> D[Simpan pesan customer]
-    D --> E[Cari artikel KB berstatus Aktif]
-    E --> F[Bangun prompt dengan konteks KB]
-    F --> G[Gemini API]
-    G --> H[Guardrail & klasifikasi aturan]
-    H --> I{Risiko tinggi?}
-    I -- Ya --> J[Menunggu persetujuan manusia]
-    I -- Komplain / tidak ada jawaban --> K[Menunggu agen]
-    I -- Tidak --> L[Selesai otomatis]
-    J --> M[Simpan jawaban, tiket, notifikasi & audit]
-    K --> M
-    L --> M
-    M --> N[Frontend menampilkan balasan]
-    O[Admin mengelola KB / tiket / persetujuan] --> E
+    S([Pesan customer]) --> G{gate}
+    G -- AI dikunci / customer disuspend --> H[human_only: teruskan ke admin]
+    G --> IG[input_guard: masking + pola manipulasi]
+    IG -- manipulasi --> E[escalate: peringatan + alihkan ke admin]
+    IG --> C[classify: Gemini / aturan]
+    C -- manipulasi halus --> E
+    C -- sapaan / di luar topik --> T[respond_template]
+    C --> R[retrieve: BM25 knowledge]
+    R -- tidak ada knowledge --> N[no_answer: tidak menebak]
+    R --> GEN[generate: Gemini JSON grounded]
+    GEN -- manipulasi --> E
+    GEN --> OG[output_guard: cek nomor/URL/klaim]
+    T --> F[finalize: status tiket]
+    N --> F
+    OG --> F
 ```
 
-## 5. Struktur program
+| Intent | Status tiket |
+|---|---|
+| Inquiry terjawab dengan sumber | Selesai otomatis |
+| Inquiry tanpa knowledge / jawaban diblok | Menunggu agen |
+| Komplain | Menunggu agen (prioritas tinggi) |
+| Laporan penipuan / kartu hilang | Menunggu agen (prioritas tinggi, risiko) |
+| Permintaan tindakan (blokir, refund, ubah data) | Menunggu persetujuan |
+| Upaya manipulasi AI | **Dialihkan ke admin** (AI dikunci di kasus itu) |
+
+Status "menunggu" tidak turun kembali ke "Selesai otomatis" hanya karena customer bertanya hal lain.
+
+## 5. Guardrail — alur untuk admin
+
+- Menu **Guardrail** menampilkan semua kejadian (pola manipulasi, deteksi AI, jawaban AI yang diblok, data rahasia yang disamarkan) dan daftar customer yang punya peringatan.
+- **Konfirmasi** = deteksi benar. **Salah deteksi** = peringatan customer dikurangi dan AI di kasus itu aktif lagi.
+- **Pulihkan akses AI & reset peringatan** untuk customer yang telah mencapai batas.
+- Di **Kasus & Percakapan**, tombol **Aktifkan AI kembali** membuka kunci AI untuk satu kasus.
+
+## 6. Konfigurasi (`backend/.env`)
+
+| Variabel | Default | Fungsi |
+|---|---|---|
+| `ORG_NAME` | `BCA` | Nama organisasi di sapaan & prompt. Ganti bila knowledge untuk bank lain. |
+| `LLM_CLASSIFIER` | `true` | Klasifikasi + deteksi manipulasi dengan Gemini (1 panggilan tambahan/pesan). `false` = hemat kuota, aturan pola saja. |
+| `KB_MIN_SCORE` | `3.0` | Ambang relevansi. Naikkan jika AI memakai bagian yang kurang cocok; turunkan jika terlalu sering "belum tahu". |
+| `KB_TOP_K` | `4` | Jumlah bagian maksimum yang dikirim ke Gemini. |
+| `GUARDRAIL_MAX_STRIKES` | `3` | Batas peringatan sebelum AI dinonaktifkan untuk customer. |
+| `KNOWLEDGE_AUTO_SYNC` | `true` | Impor otomatis isi folder `knowledge/` saat start. |
+| `MAX_UPLOAD_MB` | `5` | Batas ukuran file unggahan. |
+
+## 7. Pengujian
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m tests.smoke_test
+```
+
+30 uji end-to-end (upload & versi, pencarian, routing, guardrail, masking, pemulihan admin) dengan Gemini **tiruan** — tidak memakai kuota dan tidak menyentuh `vteki.db`.
+
+## 8. Struktur program
 
 ```text
-vteki_gemini/
-├── README.md
-├── frontend/
-│   └── index.html             # UI login, dashboard, chat, KB, approval, audit
+VTEKI_Chatbot/
+├── knowledge/                      # file knowledge (otomatis diimpor saat start)
+├── frontend/index.html             # UI customer & admin
 └── backend/
-    ├── .env.example           # template konfigurasi rahasia
-    ├── requirements.txt       # dependensi Python
-    ├── vteki.db               # dibuat otomatis saat pertama dijalankan
+    ├── requirements.txt
+    ├── .env.example
+    ├── tests/smoke_test.py         # uji end-to-end (LLM ditiru)
     └── app/
-        ├── __init__.py
-        ├── config.py          # membaca .env dan konfigurasi model
-        ├── db.py              # skema SQLite dan data demo
-        ├── security.py        # hash password, sesi bearer, role, audit
-        └── main.py            # REST API, RAG, integrasi Gemini, workflow tiket
+        ├── main.py                 # REST API & penyimpanan hasil
+        ├── agent.py                # graph LangGraph + prompt
+        ├── knowledge.py            # parser file, chunking, BM25
+        ├── guardrails.py           # deteksi manipulasi, masking, output guard
+        ├── llm.py                  # pembungkus Gemini (JSON + model cadangan)
+        ├── db.py                   # skema SQLite + migrasi
+        ├── security.py             # hash password, sesi, role, audit
+        └── config.py
 ```
 
-## 6. Endpoint penting
+## 9. Endpoint baru
 
-| Endpoint | Akses | Fungsi |
-|---|---|---|
-| `POST /api/auth/login` | Publik | Login |
-| `GET /api/auth/me` | Login | Profil sesi |
-| `POST /api/auth/logout` | Login | Hapus sesi |
-| `GET/POST /api/cases` | Login | Daftar/buat tiket |
-| `GET /api/cases/{id}/messages` | Pemilik atau Admin | Riwayat pesan |
-| `POST /api/chat` | Login | Chat Gemini + KB |
-| `GET/POST /api/knowledge` | Admin | Daftar/tambah artikel |
-| `PUT/DELETE /api/knowledge/{id}` | Admin | Ubah/hapus artikel |
-| `POST /api/knowledge/import-text` | Admin | Impor teks sebagai artikel |
-| `GET /api/notifications` | Login | Daftar notifikasi |
-| `GET /api/admin/dashboard` | Admin | Ringkasan operasional |
-| `GET /api/admin/approvals` | Admin | Permintaan yang menunggu persetujuan |
-| `POST /api/admin/approvals/{id}` | Admin | Setujui/tolak permintaan demo |
-| `POST /api/admin/cases/{id}/reply` | Admin | Balasan agen manusia |
-| `GET /api/admin/audit` | Admin | Audit trail |
-| `GET /api/health` | Publik | Status server dan konfigurasi Gemini |
+| Endpoint | Fungsi |
+|---|---|
+| `POST /api/knowledge/upload` | Unggah satu/banyak file (multipart: `files`, `status`, `mode`, `category`) |
+| `POST /api/knowledge/preview` | Pratinjau pemecahan file tanpa menyimpan |
+| `GET /api/knowledge/documents` · `GET/PATCH/DELETE /api/knowledge/documents/{id}` | Kelola dokumen |
+| `GET /api/knowledge/documents/{id}/download` · `POST …/reindex` | Unduh teks asli · pecah ulang |
+| `POST /api/knowledge/search-test` | Uji bagian mana yang dipakai untuk sebuah pertanyaan |
+| `GET /api/admin/guardrail` · `POST /api/admin/guardrail/{id}/review` | Kejadian guardrail & tinjauan |
+| `POST /api/admin/users/{id}/restore-ai` · `POST /api/admin/cases/{id}/unlock-ai` | Pulihkan akses AI |
+| `GET /api/admin/graph` | Diagram LangGraph (Mermaid) |
 
-## 7. Catatan teknis dan batasan
+Endpoint lama tetap tersedia. Dokumentasi interaktif: http://127.0.0.1:8000/docs
 
-- Implementasi retrieval saat ini **RAG sederhana berbasis pencocokan kata**, belum memakai embedding/vector database. Untuk skala besar, pertimbangkan Gemini Embeddings dan vector store.
-- Tidak ada integrasi dengan sistem core banking, OTP sungguhan, payment gateway, email, atau SMS.
-- Akun demo dan data KB bersifat contoh; jangan gunakan untuk layanan pelanggan produksi.
-- Sebelum deployment, tambahkan HTTPS, rate limiting, proteksi brute-force, kebijakan retensi data, secret manager, migrasi database, pengujian, dan validasi keamanan. Ganti `APP_SECRET`, kata sandi demo, CORS, serta mekanisme sesi sesuai lingkungan deployment.
-- Jangan pernah meminta atau menyimpan PIN, password, OTP, CVV, atau nomor kartu penuh dalam chat.
+## 10. Batasan
 
-## Referensi
-
-- Gemini API model: https://ai.google.dev/gemini-api/docs/models
-- Gemini API Python SDK: https://googleapis.github.io/python-genai/
-- FastAPI: https://fastapi.tiangolo.com/
+- Guardrail berlapis menekan risiko manipulasi, tetapi tidak ada guardrail yang 100% kebal; admin tetap perlu meninjau kejadian.
+- Pencarian memakai BM25 (kata), belum embedding/vektor. Untuk ribuan dokumen, pertimbangkan Gemini Embeddings + vector store.
+- Pada free tier Gemini, data input dapat dipakai Google untuk peningkatan produk — jangan masukkan data nasabah asli.
+- Sebelum produksi: HTTPS, rate limiting, ganti akun demo, secret manager, dan kebijakan retensi data.

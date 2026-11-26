@@ -25,7 +25,7 @@ def current_user(authorization: str | None = Header(default=None)):
         raise HTTPException(401, 'Silakan login terlebih dahulu.')
     token = authorization[7:].strip()
     with connect() as c:
-        row = c.execute('''SELECT u.id,u.email,u.name,u.role FROM sessions s
+        row = c.execute('''SELECT u.id,u.email,u.name,u.role,u.guardrail_strikes,u.ai_suspended FROM sessions s
                            JOIN users u ON u.id=s.user_id WHERE s.token=?''', (token,)).fetchone()
     if not row:
         raise HTTPException(401, 'Sesi tidak valid. Silakan login kembali.')
