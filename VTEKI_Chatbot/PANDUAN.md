@@ -70,32 +70,17 @@ Skenario uji cepat (login Customer):
 Skenario spesifikasi tambahan:
 - **Tamu (AL0):** di halaman masuk klik **Chat sebagai tamu** atau **Simulator WhatsApp** → tanya FAQ (dijawab) → "status keluhan saya?" → **Verifikasi identitas** → isi nomor `081234567890` → OTP → percakapan ditautkan ke akun nasabah. Salah OTP 3x berturut-turut → sesi dikunci 15 menit & otomatis dialihkan ke agen.
 - **Bukti:** pada laporan penipuan, klik **Unggah bukti** (PDF/JPG/PNG/TXT/DOCX) → status *Karantina* → *Bersih*/*Ditolak* setelah dipindai.
-- **Agen manusia** (`agen@vteki.id` / `agen1234`): **Antrean Handoff** → buka kasus → lihat **Tiket CRM**, **Paket Handoff 17 field**, **Bukti** → **✨ Draf Copilot** → sunting & kirim → **✓ Tutup tiket…** (checklist + akar masalah).
+- **Agen manusia** (`agen@vteki.id` / `agen1234`): **Antrean Handoff** → buka kasus → lihat **Tiket CRM**, **Paket Handoff 17 field**, **Bukti** → ** Draf Copilot** → sunting & kirim → **✓ Tutup tiket…** (checklist + akar masalah).
 - **Supervisor** (`admin@vteki.id`): **Analitik SLA & QA** (kepatuhan SLA, akar masalah, sampling QA) dan **Simulator Email**.
 
 Menambah knowledge: login Admin → **Basis Pengetahuan** → seret file .md/.txt/.pdf/.docx → **Pratinjau** → **Unggah**. Atau taruh file di folder `knowledge/` lalu restart backend.
 
-## 7. Troubleshooting
-| Gejala | Penyebab / solusi |
-|---|---|
-| `GEMINI_API_KEY belum diisi` | Isi `backend/.env`, lalu restart backend. |
-| `API key Gemini ditolak` | Key salah/dicabut; buat ulang di AI Studio. |
-| Error 429 / kuota habis | Batas gratis (per menit/hari) tercapai; tunggu, atau gunakan model cadangan. Kuota harian reset tengah malam waktu Pasifik. |
-| 404 model not found | Ganti `GEMINI_MODEL` dengan model yang tertera di AI Studio. |
-| Frontend "Failed to fetch" | Backend belum jalan, atau frontend dibuka lewat `file://`; pakai port 5500 (CORS hanya mengizinkan 5500/8000). |
-| `py` tidak dikenali | Python belum di PATH; instal ulang dengan opsi *Add to PATH*. |
-| `.venv` lama error | Hapus folder `backend\.venv` (dibuat di PC lain/versi Python lain), jalankan `setup.bat` lagi. |
 
-| `No module named 'langgraph'` / `python-multipart` | Paket versi 2 belum terpasang: jalankan `setup.bat` lagi atau `pip install -r requirements.txt`. |
-| AI terlalu sering "belum tahu" | Cek dengan **Uji pencarian** di Basis Pengetahuan; tambah kata kunci pada bagian terkait, atau turunkan `KB_MIN_SCORE` di `.env`. |
-| Kuota Gemini cepat habis | Set `LLM_CLASSIFIER=false` di `.env` (hemat 1 panggilan per pesan; guardrail pola tetap aktif). |
-| Customer salah terkena peringatan | Admin → **Guardrail** → *Salah deteksi* (peringatan dikurangi & AI aktif lagi). |
-
-## 8. Catatan
+## 7. Catatan
 - Pada free tier Google, data input dapat dipakai untuk meningkatkan produk Google; **jangan masukkan data nasabah asli**.
 - Untuk produksi: HTTPS, rate limiting, ganti akun demo, dan gunakan paket berbayar/penyedia lain.
 
-## Perubahan versi 2
+## Perubaha
 - Knowledge dari file (.md/.txt/.pdf/.docx), dipecah per bagian, dengan versi, pratinjau, dan uji pencarian.
 - Pencarian BM25 + stemmer bahasa Indonesia; jawaban wajib bersumber, jika tidak → diteruskan ke agen.
 - Guardrail anti-manipulasi: peringatan ke customer, eskalasi langsung ke admin, penguncian AI, batas 3 peringatan.
