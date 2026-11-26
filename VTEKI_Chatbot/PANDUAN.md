@@ -88,7 +88,7 @@ Menambah knowledge: login Admin → **Basis Pengetahuan** → seret file .md/.tx
 - Routing percakapan memakai LangGraph. Lihat README.md untuk detail.
 
 ## Perubahan versi sebelumnya
-- Model default `gemini-2.5-flash` + model cadangan otomatis (`GEMINI_FALLBACK_MODELS`).
-- Aturan sistem dipindah ke `system_instruction`; `thinking` dimatikan untuk 2.5 Flash dan batas output 1024 token agar jawaban tidak kosong.
+- Model default `gemini-3.5-flash-lite` + model cadangan otomatis (`GEMINI_FALLBACK_MODELS`).
+- Aturan sistem dipindah ke `system_instruction`; `thinking` dimatikan untuk 3.5 Flash lite dan batas output 1024 token agar jawaban tidak kosong.
 - Error API key / kuota ditampilkan jelas, kode komentar lama dibersihkan.
 - Ditambah `setup.bat`, `start_all.bat`, `test_gemini.py`.
