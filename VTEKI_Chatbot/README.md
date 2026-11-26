@@ -310,6 +310,6 @@ Endpoint lama tetap tersedia. Dokumentasi interaktif: http://127.0.0.1:8000/docs
 
 - Guardrail berlapis menekan risiko manipulasi, tetapi tidak ada guardrail yang 100% kebal; admin tetap perlu meninjau kejadian.
 - Pencarian memakai BM25 (kata), belum embedding/vektor. Untuk ribuan dokumen, pertimbangkan Gemini Embeddings + vector store.
-- Pada free tier Gemini, data input dapat dipakai Google untuk peningkatan produk — jangan masukkan data nasabah asli.
+- Pada free tier Gemini, data input dapat dipakai Google untuk peningkatan produk - jangan masukkan data nasabah asli.
 - Sebelum produksi: HTTPS, ganti akun demo, secret manager, kebijakan retensi data, rate limiter & antrean terdistribusi (Redis/Celery), dan pemindai ClamAV sungguhan (pemindai bawaan hanya cadangan untuk prototipe).
 - Ringkasan handoff disusun berbasis aturan agar cepat & hemat kuota; ringkasan LLM tersedia lewat tombol *Draf Copilot*.
