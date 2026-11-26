@@ -1,4 +1,4 @@
-# V-TEKI Workspace — Chatbot Layanan Pelanggan (Gemini + LangGraph)
+# V-TEKI Workspace - Chatbot Layanan Pelanggan (Gemini + LangGraph)
 
 Prototipe *Platform Layanan Pelanggan & Penyelesaian Keluhan Berbasis AI Agentik*. Stack: **FastAPI + SQLite + LangGraph + LLM (Gemini default; Anthropic/OpenAI/Ollama lewat adapter)**. Knowledge base saat ini memakai dokumen `knowledge/BCA_Knowledge_Base_Customer_Service.md`.
 
@@ -53,7 +53,7 @@ Fitur dibangun di stack yang sudah ada (keputusan tim: **fitur dulu, stack tetap
 | **Output guard** | Jawaban AI diblok bila menyebut nomor/URL yang tidak ada di knowledge, meminta OTP/PIN, mengaku sudah memblokir/refund, atau membocorkan instruksi. |
 | **Masking data rahasia** | OTP, PIN, password, CVV, dan nomor kartu (cek Luhn) disamarkan sebelum disimpan atau dikirim ke Gemini. |
 | **Routing LangGraph** | Lihat diagram di bawah. Rute tiap pesan terlihat oleh admin di halaman Kasus. |
-| **Autentikasi AL0–AL3** | Customer membuktikan dirinya (OTP, PIN transaksi) sebelum melihat saldo/mutasi atau mengajukan tindakan berisiko. Lihat bagian 4b. |
+| **Autentikasi AL0-AL3** | Customer membuktikan dirinya (OTP, PIN transaksi) sebelum melihat saldo/mutasi atau mengajukan tindakan berisiko. Lihat bagian 4b. |
 
 ## 1. Instalasi (Windows)
 
@@ -80,7 +80,7 @@ Terminal kedua: `cd frontend` lalu `py -m http.server 5500`, buka http://127.0.0
 |---|---|---|
 | Supervisor / Admin | `admin@vteki.id` | `admin123` |
 | Agen manusia | `agen@vteki.id` | `agen1234` |
-| Tamu (AL0) | — | tombol **Chat sebagai tamu** / **Simulator WhatsApp** di halaman masuk |
+| Tamu (AL0) | - | tombol **Chat sebagai tamu** / **Simulator WhatsApp** di halaman masuk |
 | Customer | `customer@vteki.id` | `cust1234` (HP demo `081234567890`, **PIN transaksi `246810`**, rekening demo saldo Rp 12.450.000, kartu debit •••• 4321 & kredit •••• 8765) |
 
 ## 3. Mengelola knowledge
@@ -107,9 +107,9 @@ Terminal kedua: `cd frontend` lalu `py -m http.server 5500`, buka http://127.0.0
 ```
 
 Jenis bagian:
-- **fakta** — dicari & dipakai untuk menjawab.
-- **instruksi** — judul seperti "Instruksi untuk AI", "Jika jawaban tidak ditemukan"; ditambahkan ke prompt sebagai panduan (tidak bisa mengalahkan aturan inti).
-- **metadata** — disimpan, tidak pernah dipakai.
+- **fakta** - dicari & dipakai untuk menjawab.
+- **instruksi** - judul seperti "Instruksi untuk AI", "Jika jawaban tidak ditemukan"; ditambahkan ke prompt sebagai panduan (tidak bisa mengalahkan aturan inti).
+- **metadata** - disimpan, tidak pernah dipakai.
 
 Bagian bertanda *dinamis* (biaya, limit, nomor, ketentuan) membuat AI mengingatkan customer untuk memverifikasi di sumber resmi.
 

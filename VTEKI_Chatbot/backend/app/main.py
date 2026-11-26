@@ -23,22 +23,6 @@ app.add_middleware(CORSMiddleware, allow_origins=['http://127.0.0.1:8000', 'http
                    allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
 
 
-# ---------------------------------------------------------------------------
-# Homepage API
-# ---------------------------------------------------------------------------
-
-@app.get("/")
-def root():
-    return {
-        "status": "success",
-        "application": "V-TEKI Workspace API",
-        "version": "2.0.0",
-        "message": "Backend V-TEKI berhasil dijalankan",
-        "documentation": "/docs",
-        "health_check": "/api/health"
-    }
-
-
 @app.on_event('startup')
 def startup():
     init_db()

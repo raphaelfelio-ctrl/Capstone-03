@@ -9,6 +9,3 @@ backend/.env.example
 *.bat
 backend/storage/
 
-.gemini/setting.json
-.impeccable/config.local.json
-.impeccable/hooks.json
