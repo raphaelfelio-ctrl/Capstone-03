@@ -1,4 +1,4 @@
-# V-TEKI Workspace — Chatbot Layanan Pelanggan (Gemini + LangGraph)
+# V-TEKI Workspace - Chatbot Layanan Pelanggan (Gemini + LangGraph)
 
 Prototipe *Platform Layanan Pelanggan & Penyelesaian Keluhan Berbasis AI Agentik*. Stack: **FastAPI + SQLite + LangGraph + LLM (Gemini default; Anthropic/OpenAI/Ollama lewat adapter)**. Knowledge base saat ini memakai dokumen `knowledge/BCA_Knowledge_Base_Customer_Service.md`.
 
