@@ -5,3 +5,4 @@ backend/app/__pycache__/
 backend/vteki.db
 *.pyc
 backend/tests/__pycache__/
+backend/.env.example

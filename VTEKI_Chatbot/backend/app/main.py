@@ -12,7 +12,7 @@ from .config import (ASSISTANT_NAME, GEMINI_MODEL, GUARDRAIL_MAX_STRIKES, KNOWLE
                      LLM_CLASSIFIER, MAX_UPLOAD_MB, ORG_NAME)
 from .db import connect, init_db
 from .guardrails import describe
-from .security import admin_only, audit, create_token, current_user, verify_password
+from .security import admin_only, audit, create_token, current_user, hash_password, verify_password
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger('vteki')
@@ -40,6 +40,12 @@ def startup():
 class LoginBody(BaseModel):
     email: str
     password: str
+
+
+class RegisterBody(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
 
 
 class ChatBody(BaseModel):
@@ -129,6 +135,29 @@ def _notify_admins(c, case_id, message):
 def health():
     return {'status': 'ok', 'model': GEMINI_MODEL, 'gemini_configured': llm.is_configured(), 'router': 'langgraph',
             'llm_classifier': LLM_CLASSIFIER, 'org': ORG_NAME, 'knowledge': knowledge.kb_stats()}
+
+
+@app.post('/api/auth/register')
+def register(body: RegisterBody):
+    name = body.name.strip()
+    email = body.email.strip().lower()
+    if len(name) < 2:
+        raise HTTPException(400, 'Nama minimal 2 karakter.')
+    if '@' not in email or email.startswith('@') or email.endswith('@') or '.' not in email.rsplit('@', 1)[-1]:
+        raise HTTPException(400, 'Format email tidak valid.')
+    with connect() as c:
+        exists = c.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
+        if exists:
+            raise HTTPException(409, 'Email sudah terdaftar. Silakan masuk atau gunakan email lain.')
+        cur = c.execute("INSERT INTO users(email,name,role,password_hash) VALUES(?,?, 'customer', ?)",
+                        (email, name, hash_password(body.password)))
+        user_id = cur.lastrowid
+        token = create_token()
+        c.execute('INSERT INTO sessions(token,user_id) VALUES(?,?)', (token, user_id))
+    audit(email, 'Registrasi akun customer berhasil')
+    return {'access_token': token, 'token_type': 'bearer',
+            'user': {'id': user_id, 'email': email, 'name': name, 'role': 'customer',
+                     'guardrail_strikes': 0, 'ai_suspended': 0}}
 
 
 @app.post('/api/auth/login')
